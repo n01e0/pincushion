@@ -172,6 +172,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_latest_version_from_fixture_metadata() {
+        let registry = NpmRegistry::new();
+        let metadata: NpmPackageMetadata =
+            serde_json::from_str(include_str!("../../tests/fixtures/registry/npm/chalk.json"))
+                .expect("fixture metadata should parse");
+
+        let package = registry
+            .parse_latest_version("chalk", metadata)
+            .expect("fixture latest version should parse");
+
+        assert_eq!(package.package_key(), "npm:chalk");
+        assert_eq!(package.version, "5.4.0");
+    }
+
+    #[test]
     fn rejects_registry_metadata_without_latest_dist_tag() {
         let registry = NpmRegistry::new();
         let error = registry

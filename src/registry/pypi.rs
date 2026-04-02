@@ -242,6 +242,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_latest_version_and_artifact_from_fixture_metadata() {
+        let registry = PypiRegistry::new();
+        let metadata: PypiPackageMetadata = serde_json::from_str(include_str!(
+            "../../tests/fixtures/registry/pypi/requests.json"
+        ))
+        .expect("fixture metadata should parse");
+
+        let package = registry
+            .parse_latest_version("requests", &metadata)
+            .expect("fixture latest version should parse");
+        let artifact = registry
+            .select_preferred_artifact(&package, &metadata)
+            .expect("fixture artifact should be selected");
+
+        assert_eq!(package.package_key(), "pypi:requests");
+        assert_eq!(package.version, "2.32.3");
+        assert_eq!(artifact.artifact_type, PypiArtifactType::SourceDist);
+        assert_eq!(artifact.filename, "requests-2.32.3.tar.gz");
+    }
+
+    #[test]
     fn rejects_pypi_metadata_without_version() {
         let registry = PypiRegistry::new();
         let error = registry

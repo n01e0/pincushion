@@ -1,0 +1,6 @@
+npm:
+  - react
+crates:
+  - clap
+review:
+  provider: none
