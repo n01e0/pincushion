@@ -450,10 +450,14 @@ mod tests {
 
     use serde_json::Value;
 
-    use crate::diff::{DiffSummary, SuspiciousExcerpt};
+    use crate::config::ReviewProvider;
+    use crate::diff::{DiffSummary, ManifestDiff, SuspiciousExcerpt};
+    use crate::inventory::InventorySummary;
     use crate::registry::Ecosystem;
-    use crate::review::{Confidence, ReviewOutput, ReviewVerdict};
-    use crate::signals::Signal;
+    use crate::review::{
+        Confidence, ReviewBackend, ReviewInput, ReviewInputAnalysis, ReviewOutput, ReviewVerdict,
+    };
+    use crate::signals::{Signal, SignalAnalysis};
     use crate::state::StateLayout;
 
     use super::{
@@ -677,6 +681,135 @@ mod tests {
         assert!(markdown.contains("# @types/node 20.0.0 → 20.1.0 (npm)"));
         assert!(markdown.contains("- Verdict: `benign`"));
         assert!(markdown.contains("- Signals: (none)"));
+    }
+
+    #[test]
+    fn end_to_end_fixture_pipeline_builds_review_input_and_reports() {
+        let old_root = fixture_path("e2e/npm/react/19.0.0");
+        let new_root = fixture_path("e2e/npm/react/19.1.0");
+        let old_inventory =
+            InventorySummary::collect(&old_root).expect("old fixture inventory should load");
+        let new_inventory =
+            InventorySummary::collect(&new_root).expect("new fixture inventory should load");
+        let diff = DiffSummary::between(&old_inventory, &new_inventory);
+        let manifest_diff = ManifestDiff::extract(Ecosystem::Npm, &old_root, &new_root, &diff)
+            .expect("manifest diff should extract")
+            .expect("fixture should contain a manifest diff");
+        let signal_analysis = SignalAnalysis::analyze_v0(
+            Ecosystem::Npm,
+            &old_root,
+            &new_root,
+            &old_inventory,
+            &new_inventory,
+            &diff,
+        )
+        .expect("signal analysis should succeed");
+        let review_input = ReviewInput::from_analysis(
+            ReviewInputAnalysis {
+                ecosystem: Ecosystem::Npm.as_str().to_string(),
+                package: "react".to_string(),
+                old_version: "19.0.0".to_string(),
+                new_version: "19.1.0".to_string(),
+                manifest_diff: Some(manifest_diff.diff.clone()),
+                interesting_files: signal_analysis.interesting_files.clone(),
+            },
+            &diff,
+            &signal_analysis.signals,
+        );
+        let review_backend = ReviewBackend::from_provider(ReviewProvider::None)
+            .expect("none backend should be supported");
+        let decision = review_backend.review_fail_closed(&review_input);
+
+        assert_eq!(diff.files_added, 4);
+        assert_eq!(diff.files_removed, 1);
+        assert_eq!(diff.files_changed, 1);
+        assert!(manifest_diff.diff.contains("postinstall"));
+        assert!(signal_analysis.signals.contains(&Signal::DependencyAdded));
+        assert!(signal_analysis
+            .signals
+            .contains(&Signal::InstallScriptAdded));
+        assert!(signal_analysis.signals.contains(&Signal::EntrypointChanged));
+        assert!(signal_analysis
+            .signals
+            .contains(&Signal::NetworkProcessEnvAccessAdded));
+        assert!(review_input
+            .interesting_files
+            .iter()
+            .any(|excerpt| excerpt.path == "package.json"));
+        assert!(review_input
+            .interesting_files
+            .iter()
+            .any(|excerpt| excerpt.path == "scripts/postinstall.js"));
+        assert_eq!(decision.status, "ok");
+        assert_eq!(decision.output.verdict, ReviewVerdict::NeedsReview);
+        assert!(decision
+            .output
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("provider=none")));
+
+        let repo_root = TestDir::new("reports-e2e");
+        let state_layout =
+            StateLayout::from_repo_root(repo_root.path()).expect("state layout should build");
+        let json_path = JsonReportWriter::new(&state_layout)
+            .write_analysis(JsonReportInput {
+                status: &decision.status,
+                ecosystem: Ecosystem::Npm,
+                package: "react",
+                old_version: "19.0.0",
+                new_version: "19.1.0",
+                diff: &diff,
+                signals: &signal_analysis.signals,
+                manifest_diff: review_input.manifest_diff.clone(),
+                interesting_files: &review_input.interesting_files,
+                review: &decision.output,
+            })
+            .expect("json report should be written");
+        let markdown_path = MarkdownReportWriter::new(&state_layout)
+            .write_analysis(JsonReportInput {
+                status: &decision.status,
+                ecosystem: Ecosystem::Npm,
+                package: "react",
+                old_version: "19.0.0",
+                new_version: "19.1.0",
+                diff: &diff,
+                signals: &signal_analysis.signals,
+                manifest_diff: review_input.manifest_diff.clone(),
+                interesting_files: &review_input.interesting_files,
+                review: &decision.output,
+            })
+            .expect("markdown report should be written");
+
+        let json = fs::read_to_string(&json_path).expect("json report should exist");
+        let json_value: Value = serde_json::from_str(&json).expect("json report should parse");
+        let markdown = fs::read_to_string(&markdown_path).expect("markdown report should exist");
+
+        assert_eq!(
+            json_path,
+            state_layout
+                .reports_dir()
+                .join("npm/react/19.0.0_to_19.1.0.json")
+        );
+        assert_eq!(
+            markdown_path,
+            state_layout
+                .reports_dir()
+                .join("npm/react/19.0.0_to_19.1.0.md")
+        );
+        assert_eq!(json_value["package"], "react");
+        assert_eq!(json_value["summary"]["files_added"], 4);
+        assert!(json.contains("network-process-env-access-added"));
+        assert!(json.contains("scripts/postinstall.js"));
+        assert!(markdown.contains("# react 19.0.0 → 19.1.0 (npm)"));
+        assert!(markdown.contains("- Verdict: `needs-review`"));
+        assert!(markdown.contains("### `scripts/postinstall.js`"));
+        assert!(markdown.contains("## Manifest diff"));
+    }
+
+    fn fixture_path(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(relative)
     }
 
     struct TestDir {

@@ -1,0 +1,11 @@
+{
+  "name": "react",
+  "version": "19.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "scheduler": "1.0.0"
+  }
+}
