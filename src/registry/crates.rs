@@ -163,6 +163,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_latest_version_from_fixture_metadata() {
+        let registry = CratesRegistry::new();
+        let metadata: CratesPackageMetadata = serde_json::from_str(include_str!(
+            "../../tests/fixtures/registry/crates/clap.json"
+        ))
+        .expect("fixture metadata should parse");
+
+        let package = registry
+            .parse_latest_version("clap", metadata)
+            .expect("fixture latest version should parse");
+
+        assert_eq!(package.package_key(), "crates:clap");
+        assert_eq!(package.version, "4.5.31");
+    }
+
+    #[test]
     fn falls_back_to_newest_version_when_max_stable_is_missing() {
         let registry = CratesRegistry::new();
         let package = registry

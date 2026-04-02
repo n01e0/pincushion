@@ -1,0 +1,26 @@
+{
+  "info": {
+    "version": "2.32.3"
+  },
+  "urls": [
+    {
+      "filename": "requests-2.32.3.tar.gz",
+      "packagetype": "sdist",
+      "url": "https://files.example/requests-2.32.3.tar.gz"
+    }
+  ],
+  "releases": {
+    "2.32.3": [
+      {
+        "filename": "requests-2.32.3-py3-none-any.whl",
+        "packagetype": "bdist_wheel",
+        "url": "https://files.example/requests-2.32.3-py3-none-any.whl"
+      },
+      {
+        "filename": "requests-2.32.3.tar.gz",
+        "packagetype": "sdist",
+        "url": "https://files.example/requests-2.32.3.tar.gz"
+      }
+    ]
+  }
+}

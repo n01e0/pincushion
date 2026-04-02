@@ -163,6 +163,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_latest_version_from_fixture_metadata() {
+        let registry = RubygemsRegistry::new();
+        let metadata: RubygemsPackageMetadata = serde_json::from_str(include_str!(
+            "../../tests/fixtures/registry/rubygems/rails.json"
+        ))
+        .expect("fixture metadata should parse");
+
+        let package = registry
+            .parse_latest_version("rails", metadata)
+            .expect("fixture latest version should parse");
+
+        assert_eq!(package.package_key(), "rubygems:rails");
+        assert_eq!(package.version, "8.0.0");
+    }
+
+    #[test]
     fn rejects_rubygems_metadata_without_version() {
         let registry = RubygemsRegistry::new();
         let error = registry

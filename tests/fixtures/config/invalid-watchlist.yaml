@@ -1,0 +1,7 @@
+npm:
+  - react
+  - react
+pypi:
+  - has spaces
+review:
+  provider: none

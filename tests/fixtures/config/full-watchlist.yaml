@@ -1,0 +1,11 @@
+npm:
+  - react
+  - axios
+rubygems:
+  - rails
+pypi:
+  - requests
+crates:
+  - clap
+review:
+  provider: claude-code
