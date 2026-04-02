@@ -1,0 +1,14 @@
+{
+  "ecosystem": "npm",
+  "package": "chalk",
+  "old_version": "5.3.0",
+  "new_version": "5.4.0",
+  "summary": {
+    "files_added": 1,
+    "files_removed": 0,
+    "files_changed": 1,
+    "signals": []
+  },
+  "manifest_diff": "--- old/package.json\n+++ new/package.json\n@@ -1,6 +1,6 @@\n {\n   \"name\": \"chalk\",\n-  \"version\": \"5.3.0\",\n+  \"version\": \"5.4.0\",\n   \"type\": \"module\",\n   \"main\": \"source/index.js\"\n }\n",
+  "interesting_files": []
+}

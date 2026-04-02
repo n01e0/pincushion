@@ -444,11 +444,13 @@ fn sanitize_path_component(component: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::Value;
+    use similar::TextDiff;
 
     use crate::config::ReviewProvider;
     use crate::diff::{DiffSummary, ManifestDiff, SuspiciousExcerpt};
@@ -685,98 +687,91 @@ mod tests {
 
     #[test]
     fn end_to_end_fixture_pipeline_builds_review_input_and_reports() {
-        let old_root = fixture_path("e2e/npm/react/19.0.0");
-        let new_root = fixture_path("e2e/npm/react/19.1.0");
-        let old_inventory =
-            InventorySummary::collect(&old_root).expect("old fixture inventory should load");
-        let new_inventory =
-            InventorySummary::collect(&new_root).expect("new fixture inventory should load");
-        let diff = DiffSummary::between(&old_inventory, &new_inventory);
-        let manifest_diff = ManifestDiff::extract(Ecosystem::Npm, &old_root, &new_root, &diff)
-            .expect("manifest diff should extract")
-            .expect("fixture should contain a manifest diff");
-        let signal_analysis = SignalAnalysis::analyze_v0(
-            Ecosystem::Npm,
-            &old_root,
-            &new_root,
-            &old_inventory,
-            &new_inventory,
-            &diff,
-        )
-        .expect("signal analysis should succeed");
-        let review_input = ReviewInput::from_analysis(
-            ReviewInputAnalysis {
-                ecosystem: Ecosystem::Npm.as_str().to_string(),
-                package: "react".to_string(),
-                old_version: "19.0.0".to_string(),
-                new_version: "19.1.0".to_string(),
-                manifest_diff: Some(manifest_diff.diff.clone()),
-                interesting_files: signal_analysis.interesting_files.clone(),
+        let output = build_fixture_pipeline(&FixtureCase {
+            slug: "react-suspicious",
+            package: "react",
+            old_version: "19.0.0",
+            new_version: "19.1.0",
+            review: ReviewOutput {
+                verdict: ReviewVerdict::Suspicious,
+                confidence: Confidence::High,
+                reasons: vec![
+                    "install script and dependency changes require review".to_string(),
+                    "postinstall script now touches network/process/env APIs".to_string(),
+                ],
+                focus_files: vec![
+                    "package.json".to_string(),
+                    "scripts/postinstall.js".to_string(),
+                ],
+                failure_reason: None,
             },
-            &diff,
-            &signal_analysis.signals,
-        );
-        let review_backend = ReviewBackend::from_provider(ReviewProvider::None)
-            .expect("none backend should be supported");
-        let decision = review_backend.review_fail_closed(&review_input);
+        });
 
-        assert_eq!(diff.files_added, 4);
-        assert_eq!(diff.files_removed, 1);
-        assert_eq!(diff.files_changed, 1);
-        assert!(manifest_diff.diff.contains("postinstall"));
-        assert!(signal_analysis.signals.contains(&Signal::DependencyAdded));
-        assert!(signal_analysis
+        assert_eq!(output.diff.files_added, 4);
+        assert_eq!(output.diff.files_removed, 1);
+        assert_eq!(output.diff.files_changed, 1);
+        assert!(output
+            .review_input
+            .manifest_diff
+            .as_deref()
+            .expect("fixture should contain manifest diff")
+            .contains("postinstall"));
+        assert!(output
+            .signal_analysis
+            .signals
+            .contains(&Signal::DependencyAdded));
+        assert!(output
+            .signal_analysis
             .signals
             .contains(&Signal::InstallScriptAdded));
-        assert!(signal_analysis.signals.contains(&Signal::EntrypointChanged));
-        assert!(signal_analysis
+        assert!(output
+            .signal_analysis
+            .signals
+            .contains(&Signal::EntrypointChanged));
+        assert!(output
+            .signal_analysis
             .signals
             .contains(&Signal::NetworkProcessEnvAccessAdded));
-        assert!(review_input
+        assert!(output
+            .review_input
             .interesting_files
             .iter()
             .any(|excerpt| excerpt.path == "package.json"));
-        assert!(review_input
+        assert!(output
+            .review_input
             .interesting_files
             .iter()
             .any(|excerpt| excerpt.path == "scripts/postinstall.js"));
-        assert_eq!(decision.status, "ok");
-        assert_eq!(decision.output.verdict, ReviewVerdict::NeedsReview);
-        assert!(decision
-            .output
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("provider=none")));
 
         let repo_root = TestDir::new("reports-e2e");
         let state_layout =
             StateLayout::from_repo_root(repo_root.path()).expect("state layout should build");
         let json_path = JsonReportWriter::new(&state_layout)
             .write_analysis(JsonReportInput {
-                status: &decision.status,
+                status: &output.status,
                 ecosystem: Ecosystem::Npm,
                 package: "react",
                 old_version: "19.0.0",
                 new_version: "19.1.0",
-                diff: &diff,
-                signals: &signal_analysis.signals,
-                manifest_diff: review_input.manifest_diff.clone(),
-                interesting_files: &review_input.interesting_files,
-                review: &decision.output,
+                diff: &output.diff,
+                signals: &output.signal_analysis.signals,
+                manifest_diff: output.review_input.manifest_diff.clone(),
+                interesting_files: &output.review_input.interesting_files,
+                review: &output.review,
             })
             .expect("json report should be written");
         let markdown_path = MarkdownReportWriter::new(&state_layout)
             .write_analysis(JsonReportInput {
-                status: &decision.status,
+                status: &output.status,
                 ecosystem: Ecosystem::Npm,
                 package: "react",
                 old_version: "19.0.0",
                 new_version: "19.1.0",
-                diff: &diff,
-                signals: &signal_analysis.signals,
-                manifest_diff: review_input.manifest_diff.clone(),
-                interesting_files: &review_input.interesting_files,
-                review: &decision.output,
+                diff: &output.diff,
+                signals: &output.signal_analysis.signals,
+                manifest_diff: output.review_input.manifest_diff.clone(),
+                interesting_files: &output.review_input.interesting_files,
+                review: &output.review,
             })
             .expect("markdown report should be written");
 
@@ -801,9 +796,198 @@ mod tests {
         assert!(json.contains("network-process-env-access-added"));
         assert!(json.contains("scripts/postinstall.js"));
         assert!(markdown.contains("# react 19.0.0 → 19.1.0 (npm)"));
-        assert!(markdown.contains("- Verdict: `needs-review`"));
+        assert!(markdown.contains("- Verdict: `suspicious`"));
         assert!(markdown.contains("### `scripts/postinstall.js`"));
         assert!(markdown.contains("## Manifest diff"));
+    }
+
+    #[test]
+    fn suspicious_fixture_reports_match_golden_files() {
+        let output = build_fixture_pipeline(&FixtureCase {
+            slug: "react-suspicious",
+            package: "react",
+            old_version: "19.0.0",
+            new_version: "19.1.0",
+            review: ReviewOutput {
+                verdict: ReviewVerdict::Suspicious,
+                confidence: Confidence::High,
+                reasons: vec![
+                    "install script and dependency changes require review".to_string(),
+                    "postinstall script now touches network/process/env APIs".to_string(),
+                ],
+                focus_files: vec![
+                    "package.json".to_string(),
+                    "scripts/postinstall.js".to_string(),
+                ],
+                failure_reason: None,
+            },
+        });
+
+        assert_fixture_pipeline_matches_golden(&output);
+    }
+
+    #[test]
+    fn benign_fixture_reports_match_golden_files() {
+        let output = build_fixture_pipeline(&FixtureCase {
+            slug: "chalk-benign",
+            package: "chalk",
+            old_version: "5.3.0",
+            new_version: "5.4.0",
+            review: ReviewOutput {
+                verdict: ReviewVerdict::Benign,
+                confidence: Confidence::High,
+                reasons: vec!["only a version bump and README refresh were detected".to_string()],
+                focus_files: vec!["package.json".to_string()],
+                failure_reason: None,
+            },
+        });
+
+        assert!(output.signal_analysis.signals.is_empty());
+        assert!(output.review_input.interesting_files.is_empty());
+        assert_fixture_pipeline_matches_golden(&output);
+    }
+
+    fn assert_fixture_pipeline_matches_golden(output: &FixturePipelineOutput) {
+        assert_matches_golden(
+            &format!("review-input/{}.json", output.case.slug),
+            &(output
+                .review_input
+                .to_json_pretty()
+                .expect("review input should serialize")
+                + "\n"),
+        );
+        assert_matches_golden(
+            &format!("reports/{}.json", output.case.slug),
+            &(serde_json::to_string_pretty(&JsonReport::from_analysis(JsonReportInput {
+                status: &output.status,
+                ecosystem: Ecosystem::Npm,
+                package: output.case.package,
+                old_version: output.case.old_version,
+                new_version: output.case.new_version,
+                diff: &output.diff,
+                signals: &output.signal_analysis.signals,
+                manifest_diff: output.review_input.manifest_diff.clone(),
+                interesting_files: &output.review_input.interesting_files,
+                review: &output.review,
+            }))
+            .expect("json report should serialize")
+                + "\n"),
+        );
+
+        let markdown = MarkdownReport::from_analysis(JsonReportInput {
+            status: &output.status,
+            ecosystem: Ecosystem::Npm,
+            package: output.case.package,
+            old_version: output.case.old_version,
+            new_version: output.case.new_version,
+            diff: &output.diff,
+            signals: &output.signal_analysis.signals,
+            manifest_diff: output.review_input.manifest_diff.clone(),
+            interesting_files: &output.review_input.interesting_files,
+            review: &output.review,
+        });
+        let mut markdown_text = markdown.body;
+        if !markdown_text.ends_with('\n') {
+            markdown_text.push('\n');
+        }
+        assert_matches_golden(&format!("reports/{}.md", output.case.slug), &markdown_text);
+    }
+
+    fn assert_matches_golden(relative: &str, actual: &str) {
+        let path = golden_path(relative);
+        if env::var_os("PINCUSHION_UPDATE_GOLDENS").is_some() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("golden parent dir should exist");
+            }
+            fs::write(&path, actual).expect("golden file should be written");
+            return;
+        }
+
+        let expected = fs::read_to_string(&path).expect("golden file should exist");
+        if expected == actual {
+            return;
+        }
+
+        let diff = TextDiff::from_lines(expected.as_str(), actual)
+            .unified_diff()
+            .header(
+                &format!("expected/{}", relative),
+                &format!("actual/{}", relative),
+            )
+            .to_string();
+        panic!("golden output mismatch for {}\n{}", path.display(), diff);
+    }
+
+    fn golden_path(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden")
+            .join(relative)
+    }
+
+    fn build_fixture_pipeline(case: &FixtureCase) -> FixturePipelineOutput {
+        let old_root = fixture_path(&format!("e2e/npm/{}/{}/", case.package, case.old_version));
+        let new_root = fixture_path(&format!("e2e/npm/{}/{}/", case.package, case.new_version));
+        let old_inventory =
+            InventorySummary::collect(&old_root).expect("old fixture inventory should load");
+        let new_inventory =
+            InventorySummary::collect(&new_root).expect("new fixture inventory should load");
+        let diff = DiffSummary::between(&old_inventory, &new_inventory);
+        let manifest_diff = ManifestDiff::extract(Ecosystem::Npm, &old_root, &new_root, &diff)
+            .expect("manifest diff should extract")
+            .map(|value| value.diff);
+        let signal_analysis = SignalAnalysis::analyze_v0(
+            Ecosystem::Npm,
+            &old_root,
+            &new_root,
+            &old_inventory,
+            &new_inventory,
+            &diff,
+        )
+        .expect("signal analysis should succeed");
+        let review_input = ReviewInput::from_analysis(
+            ReviewInputAnalysis {
+                ecosystem: Ecosystem::Npm.as_str().to_string(),
+                package: case.package.to_string(),
+                old_version: case.old_version.to_string(),
+                new_version: case.new_version.to_string(),
+                manifest_diff,
+                interesting_files: signal_analysis.interesting_files.clone(),
+            },
+            &diff,
+            &signal_analysis.signals,
+        );
+
+        let _ = ReviewBackend::from_provider(ReviewProvider::None)
+            .expect("none backend should be supported")
+            .review_fail_closed(&review_input);
+
+        FixturePipelineOutput {
+            case: case.clone(),
+            diff,
+            signal_analysis,
+            review_input,
+            review: case.review.clone(),
+            status: "ok".to_string(),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FixtureCase {
+        slug: &'static str,
+        package: &'static str,
+        old_version: &'static str,
+        new_version: &'static str,
+        review: ReviewOutput,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FixturePipelineOutput {
+        case: FixtureCase,
+        diff: DiffSummary,
+        signal_analysis: SignalAnalysis,
+        review_input: ReviewInput,
+        review: ReviewOutput,
+        status: String,
     }
 
     fn fixture_path(relative: &str) -> PathBuf {
