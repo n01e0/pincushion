@@ -1,8 +1,133 @@
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 pub type PackageKey = String;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub const STATE_DIR_NAME: &str = ".pincushion";
+pub const SEEN_FILE_NAME: &str = "seen.json";
+pub const ARTIFACTS_DIR_NAME: &str = "artifacts";
+pub const UNPACKED_DIR_NAME: &str = "unpacked";
+pub const REPORTS_DIR_NAME: &str = "reports";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateLayout {
+    repo_root: PathBuf,
+    state_dir: PathBuf,
+    seen_file: PathBuf,
+    artifacts_dir: PathBuf,
+    unpacked_dir: PathBuf,
+    reports_dir: PathBuf,
+}
+
+impl StateLayout {
+    pub fn from_repo_root(repo_root: impl AsRef<Path>) -> io::Result<Self> {
+        let repo_root = fs::canonicalize(repo_root.as_ref())?;
+        Ok(Self::from_canonical_repo_root(repo_root))
+    }
+
+    pub fn from_config_path(config_path: impl AsRef<Path>) -> io::Result<Self> {
+        let config_path = fs::canonicalize(config_path.as_ref())?;
+        let repo_root = config_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "config path {} does not have a parent directory",
+                    config_path.display()
+                ),
+            )
+        })?;
+
+        Ok(Self::from_canonical_repo_root(repo_root.to_path_buf()))
+    }
+
+    fn from_canonical_repo_root(repo_root: PathBuf) -> Self {
+        let state_dir = repo_root.join(STATE_DIR_NAME);
+        let seen_file = state_dir.join(SEEN_FILE_NAME);
+        let artifacts_dir = state_dir.join(ARTIFACTS_DIR_NAME);
+        let unpacked_dir = state_dir.join(UNPACKED_DIR_NAME);
+        let reports_dir = state_dir.join(REPORTS_DIR_NAME);
+
+        Self {
+            repo_root,
+            state_dir,
+            seen_file,
+            artifacts_dir,
+            unpacked_dir,
+            reports_dir,
+        }
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub fn seen_file(&self) -> &Path {
+        &self.seen_file
+    }
+
+    pub fn artifacts_dir(&self) -> &Path {
+        &self.artifacts_dir
+    }
+
+    pub fn unpacked_dir(&self) -> &Path {
+        &self.unpacked_dir
+    }
+
+    pub fn reports_dir(&self) -> &Path {
+        &self.reports_dir
+    }
+
+    pub fn ensure_dirs(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.artifacts_dir)?;
+        fs::create_dir_all(&self.unpacked_dir)?;
+        fs::create_dir_all(&self.reports_dir)?;
+        Ok(())
+    }
+
+    pub fn load_seen_state(&self) -> Result<SeenState, StateError> {
+        match fs::read_to_string(&self.seen_file) {
+            Ok(contents) => {
+                serde_json::from_str(&contents).map_err(|source| StateError::ParseSeen {
+                    path: self.seen_file.clone(),
+                    source,
+                })
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(SeenState::default()),
+            Err(source) => Err(StateError::Io {
+                path: self.seen_file.clone(),
+                source,
+            }),
+        }
+    }
+
+    pub fn save_seen_state(&self, seen_state: &SeenState) -> Result<(), StateError> {
+        self.ensure_dirs().map_err(|source| StateError::Io {
+            path: self.state_dir.clone(),
+            source,
+        })?;
+
+        let contents =
+            serde_json::to_string_pretty(seen_state).map_err(StateError::SerializeSeen)?;
+        fs::write(&self.seen_file, format!("{contents}\n")).map_err(|source| StateError::Io {
+            path: self.seen_file.clone(),
+            source,
+        })?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SeenState {
     pub packages: BTreeMap<PackageKey, String>,
 }
@@ -10,5 +135,152 @@ pub struct SeenState {
 impl SeenState {
     pub fn record(&mut self, package_key: PackageKey, version: impl Into<String>) {
         self.packages.insert(package_key, version.into());
+    }
+}
+
+#[derive(Debug)]
+pub enum StateError {
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    ParseSeen {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    SerializeSeen(serde_json::Error),
+}
+
+impl fmt::Display for StateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(f, "state I/O failed for {}: {source}", path.display())
+            }
+            Self::ParseSeen { path, source } => {
+                write!(f, "failed to parse seen state {}: {source}", path.display())
+            }
+            Self::SerializeSeen(source) => write!(f, "failed to serialize seen state: {source}"),
+        }
+    }
+}
+
+impl Error for StateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::ParseSeen { source, .. } => Some(source),
+            Self::SerializeSeen(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{SeenState, StateLayout};
+
+    #[test]
+    fn creates_state_layout_from_repo_root() {
+        let repo_root = TestDir::new("layout");
+        let layout = StateLayout::from_repo_root(repo_root.path()).expect("layout should build");
+
+        let canonical_repo_root =
+            fs::canonicalize(repo_root.path()).expect("repo root should canonicalize");
+        assert_eq!(layout.repo_root(), canonical_repo_root);
+        assert_eq!(layout.state_dir(), canonical_repo_root.join(".pincushion"));
+        assert_eq!(
+            layout.seen_file(),
+            canonical_repo_root.join(".pincushion/seen.json")
+        );
+        assert_eq!(
+            layout.artifacts_dir(),
+            canonical_repo_root.join(".pincushion/artifacts")
+        );
+        assert_eq!(
+            layout.unpacked_dir(),
+            canonical_repo_root.join(".pincushion/unpacked")
+        );
+        assert_eq!(
+            layout.reports_dir(),
+            canonical_repo_root.join(".pincushion/reports")
+        );
+
+        layout
+            .ensure_dirs()
+            .expect("state directories should be created");
+
+        assert!(layout.state_dir().is_dir());
+        assert!(layout.artifacts_dir().is_dir());
+        assert!(layout.unpacked_dir().is_dir());
+        assert!(layout.reports_dir().is_dir());
+        assert!(!layout.seen_file().exists());
+    }
+
+    #[test]
+    fn loads_and_saves_seen_state_from_config_path() {
+        let repo_root = TestDir::new("seen-roundtrip");
+        let config_path = repo_root.path().join("watchlist.yaml");
+        fs::write(&config_path, "npm:\n  - serde\n").expect("config file should be written");
+
+        let layout =
+            StateLayout::from_config_path(&config_path).expect("layout should build from config");
+        assert_eq!(
+            layout.repo_root(),
+            fs::canonicalize(repo_root.path()).expect("repo root should canonicalize")
+        );
+
+        let empty = layout
+            .load_seen_state()
+            .expect("missing seen state should default");
+        assert_eq!(empty, SeenState::default());
+
+        let mut seen = SeenState::default();
+        seen.record(String::from("npm:serde"), "1.0.217");
+        seen.record(String::from("crates:anyhow"), "1.0.95");
+
+        layout
+            .save_seen_state(&seen)
+            .expect("seen state should be saved");
+
+        let persisted =
+            fs::read_to_string(layout.seen_file()).expect("seen file should be readable");
+        assert!(persisted.contains("\n  \"packages\": {\n"));
+        assert!(persisted.ends_with("\n"));
+
+        let reloaded = layout
+            .load_seen_state()
+            .expect("saved seen state should reload");
+        assert_eq!(reloaded, seen);
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos();
+            let path = env::temp_dir().join(format!("pincushion-state-{label}-{unique}"));
+            fs::create_dir_all(&path).expect("temp dir should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
