@@ -13,4 +13,5 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 similar = "2.7"
 tar = "0.4"
+toml = "0.8"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
