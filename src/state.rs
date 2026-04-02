@@ -161,6 +161,36 @@ impl BaselineState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionChange {
+    pub package: PackageVersion,
+    pub previous_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnchangedPackage {
+    pub package: PackageVersion,
+    pub previous_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewlyTrackedPackage {
+    pub package: PackageVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangeDetection {
+    pub changed: Vec<VersionChange>,
+    pub unchanged: Vec<UnchangedPackage>,
+    pub newly_tracked: Vec<NewlyTrackedPackage>,
+}
+
+impl ChangeDetection {
+    pub fn has_version_changes(&self) -> bool {
+        !self.changed.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SeenState {
     pub packages: BTreeMap<PackageKey, String>,
@@ -173,6 +203,38 @@ impl SeenState {
 
     pub fn version_for(&self, package_key: &str) -> Option<&str> {
         self.packages.get(package_key).map(String::as_str)
+    }
+
+    pub fn previous_version_for(&self, package_version: &PackageVersion) -> Option<&str> {
+        self.version_for(&package_version.package_key())
+    }
+
+    pub fn detect_changes(&self, current_versions: &[PackageVersion]) -> ChangeDetection {
+        let mut detection = ChangeDetection::default();
+
+        for package_version in current_versions {
+            match self.previous_version_for(package_version) {
+                Some(previous_version) if previous_version == package_version.version => {
+                    detection.unchanged.push(UnchangedPackage {
+                        package: package_version.clone(),
+                        previous_version: previous_version.to_string(),
+                    });
+                }
+                Some(previous_version) => {
+                    detection.changed.push(VersionChange {
+                        package: package_version.clone(),
+                        previous_version: previous_version.to_string(),
+                    });
+                }
+                None => {
+                    detection.newly_tracked.push(NewlyTrackedPackage {
+                        package: package_version.clone(),
+                    });
+                }
+            }
+        }
+
+        detection
     }
 
     pub fn from_package_versions(package_versions: &[PackageVersion]) -> Self {
@@ -239,7 +301,7 @@ mod tests {
 
     use crate::registry::{Ecosystem, PackageVersion};
 
-    use super::{BaselineState, SeenState, StateLayout};
+    use super::{BaselineState, ChangeDetection, SeenState, StateLayout};
 
     #[test]
     fn creates_state_layout_from_repo_root() {
@@ -366,6 +428,56 @@ mod tests {
             .load_seen_state()
             .expect("seen state should still be readable");
         assert_eq!(persisted, existing);
+    }
+
+    #[test]
+    fn previous_version_lookup_is_ecosystem_aware() {
+        let mut seen = SeenState::default();
+        seen.record(String::from("npm:requests"), "1.0.0");
+        seen.record(String::from("pypi:requests"), "2.32.3");
+
+        assert_eq!(
+            seen.previous_version_for(&package_version(Ecosystem::Npm, "requests", "1.1.0")),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            seen.previous_version_for(&package_version(Ecosystem::Pypi, "requests", "2.32.4")),
+            Some("2.32.3")
+        );
+        assert_eq!(
+            seen.previous_version_for(&package_version(Ecosystem::Crates, "requests", "0.1.0")),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_changed_unchanged_and_new_packages() {
+        let seen = SeenState::from_package_versions(&[
+            package_version(Ecosystem::Npm, "react", "19.0.0"),
+            package_version(Ecosystem::Crates, "clap", "4.5.31"),
+        ]);
+
+        let detection: ChangeDetection = seen.detect_changes(&[
+            package_version(Ecosystem::Npm, "react", "19.1.0"),
+            package_version(Ecosystem::Crates, "clap", "4.5.31"),
+            package_version(Ecosystem::Pypi, "requests", "2.32.3"),
+        ]);
+
+        assert!(detection.has_version_changes());
+        assert_eq!(detection.changed.len(), 1);
+        assert_eq!(detection.changed[0].package.package_key(), "npm:react");
+        assert_eq!(detection.changed[0].previous_version, "19.0.0");
+        assert_eq!(detection.changed[0].package.version, "19.1.0");
+
+        assert_eq!(detection.unchanged.len(), 1);
+        assert_eq!(detection.unchanged[0].package.package_key(), "crates:clap");
+        assert_eq!(detection.unchanged[0].previous_version, "4.5.31");
+
+        assert_eq!(detection.newly_tracked.len(), 1);
+        assert_eq!(
+            detection.newly_tracked[0].package.package_key(),
+            "pypi:requests"
+        );
     }
 
     fn package_version(ecosystem: Ecosystem, package: &str, version: &str) -> PackageVersion {
