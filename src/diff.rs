@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 
 use crate::inventory::{FileEntry, InventorySummary};
@@ -117,14 +118,14 @@ impl ManifestDiff {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuspiciousExcerpt {
     pub path: String,
     pub reason: String,
     pub excerpt: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuspiciousExcerptRequest {
     pub path: String,
     pub reason: String,
