@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::unpack::SafeUnpacker;
+
 use super::{
     DownloadedArtifact, Ecosystem, PackageVersion, Registry, RegistryError, RegistryResult,
 };
@@ -107,8 +109,16 @@ impl Registry for RubygemsRegistry {
         ))
     }
 
-    fn unpack(&self, _artifact: &Path, _destination: &Path) -> RegistryResult<()> {
-        Err(RegistryError::placeholder(self.ecosystem(), "unpack"))
+    fn unpack(&self, artifact: &Path, destination: &Path) -> RegistryResult<()> {
+        SafeUnpacker::default()
+            .unpack_gem(artifact, destination)
+            .map(|_| ())
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to unpack rubygems artifact {}: {source}",
+                    artifact.display()
+                ))
+            })
     }
 }
 
