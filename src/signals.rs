@@ -197,6 +197,13 @@ fn analyze_generic_file_signals(
     }
 
     for suspicious_path in diff.added_paths.iter().chain(&diff.modified_paths) {
+        if new_entries
+            .get(suspicious_path.as_str())
+            .is_some_and(|entry| entry.file_type != FileType::File)
+        {
+            continue;
+        }
+
         let file_path = new_root.join(suspicious_path);
         let Some(text) = read_optional_signal_text(&file_path)? else {
             continue;
