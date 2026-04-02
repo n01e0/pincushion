@@ -3,6 +3,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ReviewProvider;
 use crate::diff::{DiffSummary, SuspiciousExcerpt};
 use crate::signals::Signal;
 
@@ -131,6 +132,55 @@ impl ReviewOutput {
     }
 }
 
+pub trait Reviewer {
+    fn review(&self, input: &ReviewInput) -> Result<ReviewOutput, ReviewBackendError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NoneReviewer;
+
+impl Reviewer for NoneReviewer {
+    fn review(&self, input: &ReviewInput) -> Result<ReviewOutput, ReviewBackendError> {
+        let focus_files = input
+            .interesting_files
+            .iter()
+            .map(|excerpt| excerpt.path.clone())
+            .collect::<Vec<_>>();
+
+        Ok(ReviewOutput {
+            verdict: ReviewVerdict::NeedsReview,
+            confidence: Confidence::Low,
+            reasons: vec![
+                "review backend is disabled (provider=none); manual review required".to_string(),
+            ],
+            focus_files,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum ReviewBackend {
+    #[default]
+    None(NoneReviewer),
+}
+
+impl ReviewBackend {
+    pub fn from_provider(provider: ReviewProvider) -> Result<Self, ReviewBackendError> {
+        match provider {
+            ReviewProvider::None => Ok(Self::None(NoneReviewer)),
+            ReviewProvider::Codex | ReviewProvider::ClaudeCode => {
+                Err(ReviewBackendError::UnsupportedProvider(provider))
+            }
+        }
+    }
+
+    pub fn review(&self, input: &ReviewInput) -> Result<ReviewOutput, ReviewBackendError> {
+        match self {
+            Self::None(reviewer) => reviewer.review(input),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ReviewSchemaError {
     Serialize(serde_json::Error),
@@ -161,13 +211,41 @@ impl Error for ReviewSchemaError {
     }
 }
 
+#[derive(Debug)]
+pub enum ReviewBackendError {
+    UnsupportedProvider(ReviewProvider),
+}
+
+impl fmt::Display for ReviewBackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedProvider(provider) => write!(
+                f,
+                "review backend `{}` is not implemented yet",
+                review_provider_label(provider)
+            ),
+        }
+    }
+}
+
+impl Error for ReviewBackendError {}
+
+fn review_provider_label(provider: &ReviewProvider) -> &'static str {
+    match provider {
+        ReviewProvider::None => "none",
+        ReviewProvider::Codex => "codex",
+        ReviewProvider::ClaudeCode => "claude-code",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::diff::{DiffSummary, SuspiciousExcerpt};
     use crate::signals::Signal;
 
     use super::{
-        Confidence, ReviewInput, ReviewInputAnalysis, ReviewOutput, ReviewSummary, ReviewVerdict,
+        Confidence, NoneReviewer, ReviewBackend, ReviewInput, ReviewInputAnalysis, ReviewOutput,
+        ReviewProvider, ReviewSummary, ReviewVerdict, Reviewer,
     };
 
     #[test]
@@ -296,5 +374,66 @@ mod tests {
         assert_eq!(value["confidence"], "medium");
         assert_eq!(value["reasons"][0], "no suspicious changes detected");
         assert_eq!(value["focus_files"][0], "README.md");
+    }
+
+    #[test]
+    fn none_reviewer_returns_manual_review_result() {
+        let reviewer = NoneReviewer;
+        let input = ReviewInput::from_analysis(
+            ReviewInputAnalysis {
+                ecosystem: "npm".to_string(),
+                package: "axios".to_string(),
+                old_version: "1.8.0".to_string(),
+                new_version: "1.9.0".to_string(),
+                manifest_diff: None,
+                interesting_files: vec![SuspiciousExcerpt {
+                    path: "package.json".to_string(),
+                    reason: "install script changed".to_string(),
+                    excerpt: "postinstall".to_string(),
+                }],
+            },
+            &DiffSummary::default(),
+            &[],
+        );
+
+        let output = reviewer
+            .review(&input)
+            .expect("none reviewer should succeed");
+
+        assert_eq!(output.verdict, ReviewVerdict::NeedsReview);
+        assert_eq!(output.confidence, Confidence::Low);
+        assert_eq!(
+            output.reasons,
+            vec!["review backend is disabled (provider=none); manual review required"]
+        );
+        assert_eq!(output.focus_files, vec!["package.json"]);
+    }
+
+    #[test]
+    fn backend_factory_supports_none_provider() {
+        let backend = ReviewBackend::from_provider(ReviewProvider::None)
+            .expect("none provider should be supported");
+        let input = ReviewInput::default();
+        let output = backend.review(&input).expect("none backend should review");
+
+        assert_eq!(output.verdict, ReviewVerdict::NeedsReview);
+        assert_eq!(output.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn backend_factory_rejects_unimplemented_providers() {
+        let codex_error = ReviewBackend::from_provider(ReviewProvider::Codex)
+            .expect_err("codex backend should not be implemented yet");
+        assert_eq!(
+            codex_error.to_string(),
+            "review backend `codex` is not implemented yet"
+        );
+
+        let claude_error = ReviewBackend::from_provider(ReviewProvider::ClaudeCode)
+            .expect_err("claude backend should not be implemented yet");
+        assert_eq!(
+            claude_error.to_string(),
+            "review backend `claude-code` is not implemented yet"
+        );
     }
 }
