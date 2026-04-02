@@ -401,53 +401,79 @@ fn analyze_rubygems_signals(
     diff: &DiffSummary,
     builder: &mut AnalysisBuilder,
 ) -> Result<(), SignalError> {
-    let Some(manifest_path) = find_changed_path(diff, |path| {
-        matches!(file_name(path), Some("Gemfile") | Some("Gemfile.lock"))
-            || path.ends_with(".gemspec")
-    }) else {
+    let manifest_paths = diff
+        .changed_paths
+        .iter()
+        .filter(|path| {
+            matches!(file_name(path), Some("Gemfile") | Some("Gemfile.lock"))
+                || path.ends_with(".gemspec")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if manifest_paths.is_empty() {
         return Ok(());
-    };
-
-    let old_text = read_optional_text(old_root.join(&manifest_path))?.unwrap_or_default();
-    let new_text = read_optional_text(new_root.join(&manifest_path))?.unwrap_or_default();
-
-    let added_dependencies = added_matching_lines(&old_text, &new_text, |line| {
-        line.contains("add_dependency")
-            || line.contains("add_runtime_dependency")
-            || line.contains("add_development_dependency")
-    });
-    if !added_dependencies.is_empty() {
-        builder.push_signal_with_excerpt(
-            Signal::DependencyAdded,
-            manifest_path.clone(),
-            "dependency added",
-            added_dependencies,
-        );
     }
 
-    let removed_dependencies = removed_matching_lines(&old_text, &new_text, |line| {
-        line.contains("add_dependency")
-            || line.contains("add_runtime_dependency")
-            || line.contains("add_development_dependency")
-    });
-    if !removed_dependencies.is_empty() {
-        builder.push_signal_with_excerpt(
-            Signal::DependencyRemoved,
-            manifest_path.clone(),
-            "dependency removed",
-            removed_dependencies,
-        );
-    }
+    for manifest_path in manifest_paths {
+        let old_text = read_optional_text(old_root.join(&manifest_path))?.unwrap_or_default();
+        let new_text = read_optional_text(new_root.join(&manifest_path))?.unwrap_or_default();
 
-    let changed_executables =
-        changed_text_feature(&old_text, &new_text, &["executables", "bindir"]);
-    if !changed_executables.is_empty() {
-        builder.push_signal_with_excerpt(
-            Signal::EntrypointChanged,
-            manifest_path,
-            "entrypoint changed",
-            changed_executables,
-        );
+        let added_dependencies =
+            added_matching_lines(&old_text, &new_text, rubygems_dependency_line);
+        if !added_dependencies.is_empty() {
+            builder.push_signal_with_excerpt(
+                Signal::DependencyAdded,
+                manifest_path.clone(),
+                "dependency added",
+                added_dependencies,
+            );
+        }
+
+        let removed_dependencies =
+            removed_matching_lines(&old_text, &new_text, rubygems_dependency_line);
+        if !removed_dependencies.is_empty() {
+            builder.push_signal_with_excerpt(
+                Signal::DependencyRemoved,
+                manifest_path.clone(),
+                "dependency removed",
+                removed_dependencies,
+            );
+        }
+
+        if manifest_path.ends_with(".gemspec") {
+            let added_extensions =
+                added_matching_lines(&old_text, &new_text, rubygems_extension_line);
+            if !added_extensions.is_empty() {
+                builder.push_signal_with_excerpt(
+                    Signal::GemExtensionAdded,
+                    manifest_path.clone(),
+                    "gem extension added",
+                    added_extensions,
+                );
+            }
+
+            let changed_executables =
+                changed_matching_lines(&old_text, &new_text, rubygems_executable_line);
+            if !changed_executables.is_empty() {
+                builder.push_signal_with_excerpt(
+                    Signal::GemExecutablesChanged,
+                    manifest_path.clone(),
+                    "gem executables changed",
+                    changed_executables,
+                );
+            }
+
+            let metadata_drift =
+                changed_matching_lines(&old_text, &new_text, rubygems_metadata_line);
+            if !metadata_drift.is_empty() {
+                builder.push_signal_with_excerpt(
+                    Signal::DependencySourceChanged,
+                    manifest_path.clone(),
+                    "metadata drift",
+                    metadata_drift,
+                );
+            }
+        }
     }
 
     Ok(())
@@ -977,6 +1003,66 @@ where
         .collect()
 }
 
+fn changed_matching_lines<F>(old_text: &str, new_text: &str, predicate: F) -> Vec<String>
+where
+    F: Fn(&str) -> bool,
+{
+    let old_lines = old_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| predicate(line))
+        .collect::<Vec<_>>();
+    let new_lines = new_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| predicate(line))
+        .collect::<Vec<_>>();
+
+    if old_lines == new_lines {
+        Vec::new()
+    } else {
+        old_lines
+            .iter()
+            .chain(new_lines.iter())
+            .copied()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    }
+}
+
+fn rubygems_dependency_line(line: &str) -> bool {
+    line.contains("add_dependency")
+        || line.contains("add_runtime_dependency")
+        || line.contains("add_development_dependency")
+        || line.starts_with("gem ")
+}
+
+fn rubygems_extension_line(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    lowered.contains(".extensions") || lowered.contains("extensions =")
+}
+
+fn rubygems_executable_line(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    lowered.contains(".executables")
+        || lowered.contains("executables =")
+        || lowered.contains(".bindir")
+        || lowered.contains("bindir =")
+}
+
+fn rubygems_metadata_line(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    lowered.contains(".metadata")
+        || lowered.contains("metadata[")
+        || lowered.contains("homepage")
+        || lowered.contains("source_code_uri")
+        || lowered.contains("changelog_uri")
+        || lowered.contains("documentation_uri")
+        || lowered.contains("bug_tracker_uri")
+        || lowered.contains("allowed_push_host")
+        || lowered.contains("rubygems_mfa_required")
+}
+
 fn changed_text_feature(old_text: &str, new_text: &str, keywords: &[&str]) -> Vec<String> {
     keywords
         .iter()
@@ -1083,6 +1169,78 @@ mod tests {
             .iter()
             .any(|excerpt| excerpt.reason == "install script added"
                 && excerpt.excerpt.contains("postinstall")));
+    }
+
+    #[test]
+    fn analyzes_rubygems_extension_executable_and_metadata_signals() {
+        let old_root = TestDir::new("rubygems-old");
+        let new_root = TestDir::new("rubygems-new");
+        fs::write(
+            old_root.path().join("demo.gemspec"),
+            concat!(
+                "Gem::Specification.new do |spec|\n",
+                "  spec.name = \"demo\"\n",
+                "  spec.executables = [\"demo\"]\n",
+                "  spec.bindir = \"exe\"\n",
+                "  spec.homepage = \"https://old.example\"\n",
+                "  spec.metadata[\"source_code_uri\"] = \"https://old.example/src\"\n",
+                "end\n"
+            ),
+        )
+        .expect("old gemspec should be written");
+        fs::write(
+            new_root.path().join("demo.gemspec"),
+            concat!(
+                "Gem::Specification.new do |spec|\n",
+                "  spec.name = \"demo\"\n",
+                "  spec.executables = [\"demo\", \"demo-admin\"]\n",
+                "  spec.bindir = \"bin\"\n",
+                "  spec.extensions = [\"ext/demo/extconf.rb\"]\n",
+                "  spec.homepage = \"https://new.example\"\n",
+                "  spec.metadata[\"source_code_uri\"] = \"https://new.example/src\"\n",
+                "end\n"
+            ),
+        )
+        .expect("new gemspec should be written");
+
+        let analysis = SignalAnalysis::analyze_v0(
+            Ecosystem::Rubygems,
+            old_root.path(),
+            new_root.path(),
+            &InventorySummary::default(),
+            &InventorySummary::default(),
+            &DiffSummary {
+                files_changed: 1,
+                changed_paths: vec!["demo.gemspec".to_string()],
+                modified_paths: vec!["demo.gemspec".to_string()],
+                ..DiffSummary::default()
+            },
+        )
+        .expect("rubygems analysis should succeed");
+
+        assert_eq!(
+            analysis.signals,
+            vec![
+                Signal::GemExtensionAdded,
+                Signal::GemExecutablesChanged,
+                Signal::DependencySourceChanged,
+            ]
+        );
+        assert!(analysis
+            .interesting_files
+            .iter()
+            .any(|excerpt| excerpt.reason == "gem extension added"
+                && excerpt.excerpt.contains("spec.extensions")));
+        assert!(analysis
+            .interesting_files
+            .iter()
+            .any(|excerpt| excerpt.reason == "gem executables changed"
+                && excerpt.excerpt.contains("spec.executables")));
+        assert!(analysis
+            .interesting_files
+            .iter()
+            .any(|excerpt| excerpt.reason == "metadata drift"
+                && excerpt.excerpt.contains("source_code_uri")));
     }
 
     #[test]
