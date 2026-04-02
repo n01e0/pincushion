@@ -1,22 +1,99 @@
 use std::path::Path;
+use std::time::Duration;
+
+use serde::Deserialize;
 
 use super::{
     DownloadedArtifact, Ecosystem, PackageVersion, Registry, RegistryError, RegistryResult,
 };
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RubygemsRegistry;
+const DEFAULT_METADATA_BASE_URL: &str = "https://rubygems.org/api/v1/gems";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RubygemsRegistry {
+    metadata_base_url: String,
+}
+
+impl RubygemsRegistry {
+    pub fn new() -> Self {
+        Self {
+            metadata_base_url: DEFAULT_METADATA_BASE_URL.to_string(),
+        }
+    }
+
+    fn with_metadata_base_url(metadata_base_url: impl Into<String>) -> Self {
+        Self {
+            metadata_base_url: metadata_base_url.into().trim_end_matches('/').to_string(),
+        }
+    }
+
+    fn metadata_url(&self, package: &str) -> String {
+        format!("{}/{}.json", self.metadata_base_url, package)
+    }
+
+    fn parse_latest_version(
+        &self,
+        package: &str,
+        metadata: RubygemsPackageMetadata,
+    ) -> RegistryResult<PackageVersion> {
+        let latest = metadata
+            .version
+            .filter(|version| !version.trim().is_empty())
+            .ok_or_else(|| {
+                RegistryError::new(format!(
+                    "rubygems response for `{package}` is missing version"
+                ))
+            })?;
+
+        Ok(PackageVersion {
+            ecosystem: self.ecosystem(),
+            package: package.to_string(),
+            version: latest,
+        })
+    }
+}
+
+impl Default for RubygemsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Registry for RubygemsRegistry {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Rubygems
     }
 
-    fn latest_version(&self, _package: &str) -> RegistryResult<PackageVersion> {
-        Err(RegistryError::placeholder(
-            self.ecosystem(),
-            "latest_version",
-        ))
+    fn latest_version(&self, package: &str) -> RegistryResult<PackageVersion> {
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|source| {
+                RegistryError::new(format!("failed to build rubygems client: {source}"))
+            })?
+            .get(self.metadata_url(package))
+            .send()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to fetch rubygems metadata for `{package}`: {source}"
+                ))
+            })?
+            .error_for_status()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "rubygems metadata request for `{package}` failed: {source}"
+                ))
+            })?;
+
+        let metadata = response
+            .json::<RubygemsPackageMetadata>()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to parse rubygems metadata for `{package}`: {source}"
+                ))
+            })?;
+
+        self.parse_latest_version(package, metadata)
     }
 
     fn download_artifact(
@@ -32,5 +109,138 @@ impl Registry for RubygemsRegistry {
 
     fn unpack(&self, _artifact: &Path, _destination: &Path) -> RegistryResult<()> {
         Err(RegistryError::placeholder(self.ecosystem(), "unpack"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RubygemsPackageMetadata {
+    version: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn builds_metadata_url_for_gem() {
+        let registry = RubygemsRegistry::new();
+
+        assert_eq!(
+            registry.metadata_url("rails"),
+            "https://rubygems.org/api/v1/gems/rails.json"
+        );
+    }
+
+    #[test]
+    fn parses_latest_version_from_rubygems_metadata() {
+        let registry = RubygemsRegistry::new();
+        let package = registry
+            .parse_latest_version(
+                "rails",
+                RubygemsPackageMetadata {
+                    version: Some("8.0.0".to_string()),
+                },
+            )
+            .expect("latest version should parse");
+
+        assert_eq!(package.package_key(), "rubygems:rails");
+        assert_eq!(package.version, "8.0.0");
+    }
+
+    #[test]
+    fn rejects_rubygems_metadata_without_version() {
+        let registry = RubygemsRegistry::new();
+        let error = registry
+            .parse_latest_version("rails", RubygemsPackageMetadata { version: None })
+            .expect_err("missing version should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "rubygems response for `rails` is missing version"
+        );
+    }
+
+    #[test]
+    fn fetches_latest_version_from_http_registry() {
+        let server = TestServer::start(200, r#"{"version":"8.0.0"}"#);
+        let registry = RubygemsRegistry::with_metadata_base_url(server.base_url());
+
+        let package = registry
+            .latest_version("rails")
+            .expect("latest version should load");
+
+        assert_eq!(package.package, "rails");
+        assert_eq!(package.version, "8.0.0");
+        assert_eq!(package.package_key(), "rubygems:rails");
+        assert_eq!(server.request_path(), "/rails.json");
+    }
+
+    struct TestServer {
+        base_url: String,
+        request_path: Arc<Mutex<String>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn start(status_code: u16, body: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let address = listener.local_addr().expect("local addr should resolve");
+            let base_url = format!("http://{}", address);
+
+            let request_path = Arc::new(Mutex::new(String::new()));
+            let request_path_for_thread = request_path.clone();
+
+            let thread = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("request should arrive");
+                let mut buffer = [0_u8; 2048];
+                let read = stream
+                    .read(&mut buffer)
+                    .expect("request should be readable");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                *request_path_for_thread
+                    .lock()
+                    .expect("path lock should succeed") = path;
+
+                let response = format!(
+                    "HTTP/1.1 {status_code} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should be written");
+            });
+
+            Self {
+                base_url,
+                request_path,
+                thread: Some(thread),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn request_path(mut self) -> String {
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("server thread should finish");
+            }
+            self.request_path
+                .lock()
+                .expect("path lock should succeed")
+                .clone()
+        }
     }
 }
