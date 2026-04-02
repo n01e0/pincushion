@@ -33,6 +33,12 @@ pub struct PackageVersion {
     pub version: String,
 }
 
+impl PackageVersion {
+    pub fn package_key(&self) -> String {
+        format!("{}:{}", self.ecosystem.as_str(), self.package)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadedArtifact {
     pub source_url: Option<String>,
