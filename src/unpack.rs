@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -83,101 +83,8 @@ impl SafeUnpacker {
         })?;
         let decoder = GzDecoder::new(file);
         let mut archive = Archive::new(decoder);
-        let mut stats = UnpackStats::default();
 
-        let entries = archive
-            .entries()
-            .map_err(|source| UnpackError::ArchiveRead {
-                path: artifact.to_path_buf(),
-                source,
-            })?;
-
-        for entry in entries {
-            let mut entry = entry.map_err(|source| UnpackError::ArchiveRead {
-                path: artifact.to_path_buf(),
-                source,
-            })?;
-            let relative_path = entry.path().map_err(|source| UnpackError::EntryPath {
-                artifact: artifact.to_path_buf(),
-                source,
-            })?;
-            let relative_path = self.validate_entry_path(&relative_path)?;
-            let output_path = destination.join(&relative_path);
-            let entry_type = entry.header().entry_type();
-
-            if entry_type.is_dir() {
-                fs::create_dir_all(&output_path).map_err(|source| UnpackError::Io {
-                    path: output_path.clone(),
-                    source,
-                })?;
-                stats.directories_created += 1;
-                continue;
-            }
-
-            if entry_type.is_symlink() || entry_type.is_hard_link() {
-                if self.plan.materialize_links {
-                    return Err(UnpackError::UnsupportedEntryType {
-                        path: relative_path,
-                        entry_type: "link".to_string(),
-                    });
-                }
-
-                return Err(UnpackError::LinkEntryRejected {
-                    path: relative_path,
-                });
-            }
-
-            if !entry_type.is_file() {
-                return Err(UnpackError::UnsupportedEntryType {
-                    path: relative_path,
-                    entry_type: format!("{entry_type:?}"),
-                });
-            }
-
-            if stats.files_written >= self.plan.limits.max_files {
-                return Err(UnpackError::FileCountLimitExceeded {
-                    limit: self.plan.limits.max_files,
-                });
-            }
-
-            let entry_size = entry.size();
-            if entry_size > self.plan.limits.max_single_file_bytes {
-                return Err(UnpackError::SingleFileLimitExceeded {
-                    path: relative_path,
-                    limit: self.plan.limits.max_single_file_bytes,
-                    attempted: entry_size,
-                });
-            }
-
-            let total_after_write = stats.total_bytes_written.saturating_add(entry_size);
-            if total_after_write > self.plan.limits.max_total_bytes {
-                return Err(UnpackError::TotalSizeLimitExceeded {
-                    limit: self.plan.limits.max_total_bytes,
-                    attempted: total_after_write,
-                });
-            }
-
-            if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent).map_err(|source| UnpackError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-
-            let mut output = File::create(&output_path).map_err(|source| UnpackError::Io {
-                path: output_path.clone(),
-                source,
-            })?;
-            io::copy(&mut entry, &mut output).map_err(|source| UnpackError::Io {
-                path: output_path.clone(),
-                source,
-            })?;
-
-            stats.files_written += 1;
-            stats.total_bytes_written = total_after_write;
-        }
-
-        Ok(stats)
+        self.unpack_tar_archive(&mut archive, artifact, destination)
     }
 
     pub fn unpack_crate(
@@ -186,6 +93,63 @@ impl SafeUnpacker {
         destination: impl AsRef<Path>,
     ) -> Result<UnpackStats, UnpackError> {
         self.unpack_tar_gz(artifact, destination)
+    }
+
+    pub fn unpack_gem(
+        &self,
+        artifact: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<UnpackStats, UnpackError> {
+        let artifact = artifact.as_ref();
+        let destination = destination.as_ref();
+        fs::create_dir_all(destination).map_err(|source| UnpackError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+
+        let file = File::open(artifact).map_err(|source| UnpackError::Io {
+            path: artifact.to_path_buf(),
+            source,
+        })?;
+        let mut archive = Archive::new(file);
+        let entries = archive
+            .entries()
+            .map_err(|source| UnpackError::ArchiveRead {
+                path: artifact.to_path_buf(),
+                source,
+            })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|source| UnpackError::ArchiveRead {
+                path: artifact.to_path_buf(),
+                source,
+            })?;
+            let entry_path = entry.path().map_err(|source| UnpackError::EntryPath {
+                artifact: artifact.to_path_buf(),
+                source,
+            })?;
+            let entry_name = entry_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+
+            match entry_name {
+                "data.tar.gz" => {
+                    let mut decoder = GzDecoder::new(entry);
+                    let mut inner_archive = Archive::new(&mut decoder);
+                    return self.unpack_tar_archive(&mut inner_archive, artifact, destination);
+                }
+                "data.tar" => {
+                    let mut inner_archive = Archive::new(entry);
+                    return self.unpack_tar_archive(&mut inner_archive, artifact, destination);
+                }
+                _ => continue,
+            }
+        }
+
+        Err(UnpackError::GemDataArchiveMissing {
+            path: artifact.to_path_buf(),
+        })
     }
 
     pub fn unpack_zip(
@@ -299,6 +263,108 @@ impl SafeUnpacker {
         self.unpack_zip(artifact, destination)
     }
 
+    fn unpack_tar_archive<R: Read>(
+        &self,
+        archive: &mut Archive<R>,
+        artifact: &Path,
+        destination: &Path,
+    ) -> Result<UnpackStats, UnpackError> {
+        let mut stats = UnpackStats::default();
+        let entries = archive
+            .entries()
+            .map_err(|source| UnpackError::ArchiveRead {
+                path: artifact.to_path_buf(),
+                source,
+            })?;
+
+        for entry in entries {
+            let mut entry = entry.map_err(|source| UnpackError::ArchiveRead {
+                path: artifact.to_path_buf(),
+                source,
+            })?;
+            let relative_path = entry.path().map_err(|source| UnpackError::EntryPath {
+                artifact: artifact.to_path_buf(),
+                source,
+            })?;
+            let relative_path = self.validate_entry_path(&relative_path)?;
+            let output_path = destination.join(&relative_path);
+            let entry_type = entry.header().entry_type();
+
+            if entry_type.is_dir() {
+                fs::create_dir_all(&output_path).map_err(|source| UnpackError::Io {
+                    path: output_path.clone(),
+                    source,
+                })?;
+                stats.directories_created += 1;
+                continue;
+            }
+
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                if self.plan.materialize_links {
+                    return Err(UnpackError::UnsupportedEntryType {
+                        path: relative_path,
+                        entry_type: "link".to_string(),
+                    });
+                }
+
+                return Err(UnpackError::LinkEntryRejected {
+                    path: relative_path,
+                });
+            }
+
+            if !entry_type.is_file() {
+                return Err(UnpackError::UnsupportedEntryType {
+                    path: relative_path,
+                    entry_type: format!("{entry_type:?}"),
+                });
+            }
+
+            if stats.files_written >= self.plan.limits.max_files {
+                return Err(UnpackError::FileCountLimitExceeded {
+                    limit: self.plan.limits.max_files,
+                });
+            }
+
+            let entry_size = entry.size();
+            if entry_size > self.plan.limits.max_single_file_bytes {
+                return Err(UnpackError::SingleFileLimitExceeded {
+                    path: relative_path,
+                    limit: self.plan.limits.max_single_file_bytes,
+                    attempted: entry_size,
+                });
+            }
+
+            let total_after_write = stats.total_bytes_written.saturating_add(entry_size);
+            if total_after_write > self.plan.limits.max_total_bytes {
+                return Err(UnpackError::TotalSizeLimitExceeded {
+                    limit: self.plan.limits.max_total_bytes,
+                    attempted: total_after_write,
+                });
+            }
+
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent).map_err(|source| UnpackError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+
+            let mut output = File::create(&output_path).map_err(|source| UnpackError::Io {
+                path: output_path.clone(),
+                source,
+            })?;
+            io::copy(&mut entry, &mut output).map_err(|source| UnpackError::Io {
+                path: output_path.clone(),
+                source,
+            })?;
+
+            stats.files_written += 1;
+            stats.total_bytes_written = total_after_write;
+        }
+
+        Ok(stats)
+    }
+
     fn validate_entry_path(&self, path: &Path) -> Result<PathBuf, UnpackError> {
         let mut validated = PathBuf::new();
 
@@ -351,6 +417,9 @@ pub enum UnpackError {
         artifact: PathBuf,
         source: io::Error,
     },
+    GemDataArchiveMissing {
+        path: PathBuf,
+    },
     AbsolutePathRejected {
         path: PathBuf,
     },
@@ -396,6 +465,9 @@ impl fmt::Display for UnpackError {
                     "failed to read archive entry path from {}: {source}",
                     artifact.display()
                 )
+            }
+            Self::GemDataArchiveMissing { path } => {
+                write!(f, "gem archive {} is missing data.tar.gz", path.display())
             }
             Self::AbsolutePathRejected { path } => {
                 write!(
@@ -458,7 +530,8 @@ impl Error for UnpackError {
             Self::Io { source, .. }
             | Self::ArchiveRead { source, .. }
             | Self::EntryPath { source, .. } => Some(source),
-            Self::AbsolutePathRejected { .. }
+            Self::GemDataArchiveMissing { .. }
+            | Self::AbsolutePathRejected { .. }
             | Self::ParentPathRejected { .. }
             | Self::EmptyEntryPath { .. }
             | Self::LinkEntryRejected { .. }
@@ -536,6 +609,70 @@ mod tests {
         assert_eq!(stats.files_written, 1);
         assert_eq!(stats.total_bytes_written, 24);
         assert!(destination.join("crate/Cargo.toml").exists());
+    }
+
+    #[test]
+    fn unpacks_gem_archives_via_inner_data_tarball() {
+        let temp = TestDir::new("gem");
+        let artifact = temp.path().join("package.gem");
+        let destination = temp.path().join("out");
+        write_gem_archive(
+            &artifact,
+            vec![
+                ArchiveEntry::file("lib/demo.rb", b"puts 'hi'\n"),
+                ArchiveEntry::file("README.md", b"demo gem\n"),
+            ],
+        );
+
+        let stats = SafeUnpacker::default()
+            .unpack_gem(&artifact, &destination)
+            .expect("gem should unpack");
+
+        assert_eq!(stats.files_written, 2);
+        assert_eq!(stats.total_bytes_written, 19);
+        assert_eq!(
+            fs::read_to_string(destination.join("lib/demo.rb")).expect("ruby file should exist"),
+            "puts 'hi'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("README.md")).expect("readme should exist"),
+            "demo gem\n"
+        );
+    }
+
+    #[test]
+    fn rejects_gem_archives_without_data_tarball() {
+        let temp = TestDir::new("gem-missing-data");
+        let artifact = temp.path().join("broken.gem");
+        write_gem_archive_without_data(&artifact);
+
+        let error = SafeUnpacker::default()
+            .unpack_gem(&artifact, temp.path().join("out"))
+            .expect_err("gem without data tarball should fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!("gem archive {} is missing data.tar.gz", artifact.display())
+        );
+    }
+
+    #[test]
+    fn rejects_parent_path_traversal_in_gem_archives() {
+        let temp = TestDir::new("gem-parent");
+        let artifact = temp.path().join("bad.gem");
+        write_gem_archive(
+            &artifact,
+            vec![ArchiveEntry::file("pkg/../escape.rb", b"oops")],
+        );
+
+        let error = SafeUnpacker::default()
+            .unpack_gem(&artifact, temp.path().join("out"))
+            .expect_err("gem parent traversal should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "archive entry `pkg/../escape.rb` contains parent path traversal"
+        );
     }
 
     #[test]
@@ -828,6 +965,26 @@ mod tests {
         encoder.finish().expect("encoder should finish");
     }
 
+    fn write_gem_archive(path: &Path, data_entries: Vec<ArchiveEntry<'_>>) {
+        let file = File::create(path).expect("gem file should be created");
+        let mut builder = Builder::new(file);
+        let metadata_bytes = gzip_bytes(b"--- !ruby/object:Gem::Specification {}\n");
+        let data_bytes = tar_gz_bytes(data_entries);
+
+        append_tar_file(&mut builder, "metadata.gz", &metadata_bytes);
+        append_tar_file(&mut builder, "data.tar.gz", &data_bytes);
+
+        builder.finish().expect("gem builder should finish");
+    }
+
+    fn write_gem_archive_without_data(path: &Path) {
+        let file = File::create(path).expect("gem file should be created");
+        let mut builder = Builder::new(file);
+        let metadata_bytes = gzip_bytes(b"--- !ruby/object:Gem::Specification {}\n");
+        append_tar_file(&mut builder, "metadata.gz", &metadata_bytes);
+        builder.finish().expect("gem builder should finish");
+    }
+
     fn write_zip_archive(path: &Path, entries: Vec<ArchiveEntry<'_>>) {
         let file = File::create(path).expect("zip file should be created");
         let mut writer = ZipWriter::new(file);
@@ -896,6 +1053,70 @@ mod tests {
         }
 
         fs::write(path, bytes).expect("patched zip bytes should be written");
+    }
+
+    fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        std::io::Write::write_all(&mut encoder, bytes).expect("gzip bytes should be written");
+        encoder.finish().expect("gzip encoder should finish")
+    }
+
+    fn tar_gz_bytes(entries: Vec<ArchiveEntry<'_>>) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for entry in entries {
+            match entry {
+                ArchiveEntry::Directory(path) => {
+                    let mut header = Header::new_gnu();
+                    header.set_entry_type(EntryType::Directory);
+                    header.set_mode(0o755);
+                    header.set_size(0);
+                    set_header_path_unchecked(&mut header, path);
+                    header.set_cksum();
+                    builder
+                        .append(&header, std::io::empty())
+                        .expect("directory entry should be appended");
+                }
+                ArchiveEntry::File(path, contents) => {
+                    let mut header = Header::new_gnu();
+                    header.set_entry_type(EntryType::Regular);
+                    header.set_mode(0o644);
+                    header.set_size(contents.len() as u64);
+                    set_header_path_unchecked(&mut header, path);
+                    header.set_cksum();
+                    builder
+                        .append(&header, Cursor::new(contents))
+                        .expect("file entry should be appended");
+                }
+                ArchiveEntry::Symlink(path, target) => {
+                    let mut header = Header::new_gnu();
+                    header.set_entry_type(EntryType::Symlink);
+                    header.set_mode(0o777);
+                    header.set_size(0);
+                    set_header_path_unchecked(&mut header, path);
+                    set_header_link_name_unchecked(&mut header, target);
+                    header.set_cksum();
+                    builder
+                        .append(&header, std::io::empty())
+                        .expect("symlink entry should be appended");
+                }
+            }
+        }
+
+        let encoder = builder.into_inner().expect("builder should finish");
+        encoder.finish().expect("encoder should finish")
+    }
+
+    fn append_tar_file<W: std::io::Write>(builder: &mut Builder<W>, path: &str, contents: &[u8]) {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, Cursor::new(contents))
+            .expect("tar entry should be appended");
     }
 
     fn set_header_path_unchecked(header: &mut Header, path: &str) {
