@@ -165,37 +165,11 @@ pub struct CodexReviewer;
 
 impl CodexReviewer {
     pub fn build_prompt(&self, input: &ReviewInput) -> Result<String, ReviewBackendError> {
-        let payload = input.to_json_pretty().map_err(ReviewBackendError::Schema)?;
-
-        Ok(format!(
-            concat!(
-                "You are reviewing a software package update for supply-chain risk.\n",
-                "Return ONLY a JSON object with this exact schema:\n",
-                "{\n",
-                "  \"verdict\": \"benign\" | \"suspicious\" | \"needs-review\",\n",
-                "  \"confidence\": \"low\" | \"medium\" | \"high\",\n",
-                "  \"reasons\": string[],\n",
-                "  \"focus_files\": string[]\n",
-                "}\n",
-                "Rules:\n",
-                "- Output valid JSON only, no markdown, no prose outside JSON.\n",
-                "- Keep reasons concise and evidence-based.\n",
-                "- focus_files should reference paths from interesting_files when possible.\n",
-                "- Use needs-review when uncertain.\n\n",
-                "Review input JSON:\n{}\n"
-            ),
-            payload
-        ))
+        build_reviewer_prompt(input)
     }
 
     pub fn parse_output(&self, output: &str) -> Result<ReviewOutput, ReviewBackendError> {
-        let json = extract_json_object(output).ok_or_else(|| {
-            ReviewBackendError::InvalidResponse(
-                "codex output did not contain a JSON object".to_string(),
-            )
-        })?;
-
-        ReviewOutput::from_json_str(&json).map_err(ReviewBackendError::Schema)
+        parse_reviewer_output("codex", output)
     }
 
     pub fn review_with_runner<R: CodexCommandRunner>(
@@ -215,7 +189,40 @@ impl Reviewer for CodexReviewer {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeCodeReviewer;
+
+impl ClaudeCodeReviewer {
+    pub fn build_prompt(&self, input: &ReviewInput) -> Result<String, ReviewBackendError> {
+        build_reviewer_prompt(input)
+    }
+
+    pub fn parse_output(&self, output: &str) -> Result<ReviewOutput, ReviewBackendError> {
+        parse_reviewer_output("claude-code", output)
+    }
+
+    pub fn review_with_runner<R: ClaudeCodeCommandRunner>(
+        &self,
+        input: &ReviewInput,
+        runner: &R,
+    ) -> Result<ReviewOutput, ReviewBackendError> {
+        let prompt = self.build_prompt(input)?;
+        let output = runner.run(&prompt)?;
+        self.parse_output(&output)
+    }
+}
+
+impl Reviewer for ClaudeCodeReviewer {
+    fn review(&self, input: &ReviewInput) -> Result<ReviewOutput, ReviewBackendError> {
+        self.review_with_runner(input, &ProcessClaudeCodeRunner)
+    }
+}
+
 pub trait CodexCommandRunner {
+    fn run(&self, prompt: &str) -> Result<String, ReviewBackendError>;
+}
+
+pub trait ClaudeCodeCommandRunner {
     fn run(&self, prompt: &str) -> Result<String, ReviewBackendError>;
 }
 
@@ -224,32 +231,28 @@ pub struct ProcessCodexRunner;
 
 impl CodexCommandRunner for ProcessCodexRunner {
     fn run(&self, prompt: &str) -> Result<String, ReviewBackendError> {
-        let command = "codex exec <prompt>".to_string();
-        let output = Command::new("codex")
-            .arg("exec")
-            .arg(prompt)
-            .output()
-            .map_err(|source| ReviewBackendError::CommandSpawn {
-                command: command.clone(),
-                source,
-            })?;
+        run_command_capture_stdout(
+            "codex exec <prompt>",
+            Command::new("codex").arg("exec").arg(prompt),
+            "codex",
+        )
+    }
+}
 
-        if !output.status.success() {
-            return Err(ReviewBackendError::CommandFailed {
-                command,
-                status: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessClaudeCodeRunner;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if stdout.is_empty() {
-            return Err(ReviewBackendError::InvalidResponse(
-                "codex returned an empty response".to_string(),
-            ));
-        }
-
-        Ok(stdout)
+impl ClaudeCodeCommandRunner for ProcessClaudeCodeRunner {
+    fn run(&self, prompt: &str) -> Result<String, ReviewBackendError> {
+        run_command_capture_stdout(
+            "claude --print --permission-mode bypassPermissions <prompt>",
+            Command::new("claude")
+                .arg("--print")
+                .arg("--permission-mode")
+                .arg("bypassPermissions")
+                .arg(prompt),
+            "claude-code",
+        )
     }
 }
 
@@ -258,6 +261,7 @@ pub enum ReviewBackend {
     #[default]
     None(NoneReviewer),
     Codex(CodexReviewer),
+    ClaudeCode(ClaudeCodeReviewer),
 }
 
 impl ReviewBackend {
@@ -265,7 +269,7 @@ impl ReviewBackend {
         match provider {
             ReviewProvider::None => Ok(Self::None(NoneReviewer)),
             ReviewProvider::Codex => Ok(Self::Codex(CodexReviewer)),
-            ReviewProvider::ClaudeCode => Err(ReviewBackendError::UnsupportedProvider(provider)),
+            ReviewProvider::ClaudeCode => Ok(Self::ClaudeCode(ClaudeCodeReviewer)),
         }
     }
 
@@ -273,8 +277,77 @@ impl ReviewBackend {
         match self {
             Self::None(reviewer) => reviewer.review(input),
             Self::Codex(reviewer) => reviewer.review(input),
+            Self::ClaudeCode(reviewer) => reviewer.review(input),
         }
     }
+}
+
+fn build_reviewer_prompt(input: &ReviewInput) -> Result<String, ReviewBackendError> {
+    let payload = input.to_json_pretty().map_err(ReviewBackendError::Schema)?;
+
+    Ok(format!(
+        concat!(
+            "You are reviewing a software package update for supply-chain risk.\n",
+            "Return ONLY a JSON object with this exact schema:\n",
+            "{\n",
+            "  \"verdict\": \"benign\" | \"suspicious\" | \"needs-review\",\n",
+            "  \"confidence\": \"low\" | \"medium\" | \"high\",\n",
+            "  \"reasons\": string[],\n",
+            "  \"focus_files\": string[]\n",
+            "}\n",
+            "Rules:\n",
+            "- Output valid JSON only, no markdown, no prose outside JSON.\n",
+            "- Keep reasons concise and evidence-based.\n",
+            "- focus_files should reference paths from interesting_files when possible.\n",
+            "- Use needs-review when uncertain.\n\n",
+            "Review input JSON:\n{}\n"
+        ),
+        payload
+    ))
+}
+
+fn parse_reviewer_output(
+    backend_name: &'static str,
+    output: &str,
+) -> Result<ReviewOutput, ReviewBackendError> {
+    let json = extract_json_object(output).ok_or_else(|| {
+        ReviewBackendError::InvalidResponse(format!(
+            "{backend_name} output did not contain a JSON object"
+        ))
+    })?;
+
+    ReviewOutput::from_json_str(&json).map_err(ReviewBackendError::Schema)
+}
+
+fn run_command_capture_stdout(
+    command_label: &'static str,
+    command: &mut Command,
+    backend_name: &'static str,
+) -> Result<String, ReviewBackendError> {
+    let command_text = command_label.to_string();
+    let output = command
+        .output()
+        .map_err(|source| ReviewBackendError::CommandSpawn {
+            command: command_text.clone(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(ReviewBackendError::CommandFailed {
+            command: command_text,
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Err(ReviewBackendError::InvalidResponse(format!(
+            "{backend_name} returned an empty response"
+        )));
+    }
+
+    Ok(stdout)
 }
 
 #[derive(Debug)]
@@ -446,9 +519,9 @@ mod tests {
     use crate::signals::Signal;
 
     use super::{
-        extract_json_object, CodexCommandRunner, CodexReviewer, Confidence, NoneReviewer,
-        ReviewBackend, ReviewBackendError, ReviewInput, ReviewInputAnalysis, ReviewOutput,
-        ReviewProvider, ReviewSummary, ReviewVerdict, Reviewer,
+        extract_json_object, ClaudeCodeCommandRunner, ClaudeCodeReviewer, CodexCommandRunner,
+        CodexReviewer, Confidence, NoneReviewer, ReviewBackend, ReviewBackendError, ReviewInput,
+        ReviewInputAnalysis, ReviewOutput, ReviewProvider, ReviewSummary, ReviewVerdict, Reviewer,
     };
 
     #[test]
@@ -722,6 +795,19 @@ mod tests {
     }
 
     impl CodexCommandRunner for FakeCodexRunner {
+        fn run(&self, _prompt: &str) -> Result<String, ReviewBackendError> {
+            match &self.output {
+                Ok(output) => Ok(output.clone()),
+                Err(err) => Err(ReviewBackendError::InvalidResponse(err.to_string())),
+            }
+        }
+    }
+
+    struct FakeClaudeCodeRunner {
+        output: Result<String, ReviewBackendError>,
+    }
+
+    impl ClaudeCodeCommandRunner for FakeClaudeCodeRunner {
         fn run(&self, _prompt: &str) -> Result<String, ReviewBackendError> {
             match &self.output {
                 Ok(output) => Ok(output.clone()),
