@@ -378,6 +378,22 @@ mod tests {
     }
 
     #[test]
+    fn loads_seen_state_from_fixture_repo() {
+        let repo_root = TestDir::new("fixture-repo");
+        copy_fixture_dir(&fixture_repo_path(), repo_root.path());
+
+        let config_path = repo_root.path().join("watchlist.yaml");
+        let layout =
+            StateLayout::from_config_path(&config_path).expect("layout should build from fixture");
+        let seen = layout
+            .load_seen_state()
+            .expect("fixture seen state should load");
+
+        assert_eq!(seen.version_for("npm:react"), Some("19.0.0"));
+        assert_eq!(seen.version_for("crates:clap"), Some("4.5.31"));
+    }
+
+    #[test]
     fn first_run_is_baseline_only_and_persists_current_versions() {
         let repo_root = TestDir::new("baseline-first-run");
         let layout = StateLayout::from_repo_root(repo_root.path()).expect("layout should build");
@@ -485,6 +501,30 @@ mod tests {
             ecosystem,
             package: package.to_string(),
             version: version.to_string(),
+        }
+    }
+
+    fn fixture_repo_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state/sample-repo")
+    }
+
+    fn copy_fixture_dir(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("fixture destination should be created");
+
+        for entry in fs::read_dir(source).expect("fixture directory should be readable") {
+            let entry = entry.expect("fixture directory entry should load");
+            let entry_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let file_type = entry.file_type().expect("fixture file type should load");
+
+            if file_type.is_dir() {
+                copy_fixture_dir(&entry_path, &destination_path);
+            } else {
+                if let Some(parent) = destination_path.parent() {
+                    fs::create_dir_all(parent).expect("fixture parent dir should be created");
+                }
+                fs::copy(&entry_path, &destination_path).expect("fixture file should copy");
+            }
         }
     }
 

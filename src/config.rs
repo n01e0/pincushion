@@ -168,6 +168,7 @@ fn validate_package_list(ecosystem: &str, packages: &[String], errors: &mut Vec<
 mod tests {
     use std::env;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{ConfigError, ReviewProvider, WatchlistConfig};
@@ -275,5 +276,34 @@ mod tests {
 
         assert_eq!(config.npm, vec!["react"]);
         assert_eq!(config.review.provider, ReviewProvider::Codex);
+    }
+
+    #[test]
+    fn loads_full_watchlist_fixture_from_disk() {
+        let config = WatchlistConfig::load_from_path(fixture_path("full-watchlist.yaml"))
+            .expect("fixture config should load from disk");
+
+        assert_eq!(config.npm, vec!["react", "axios"]);
+        assert_eq!(config.rubygems, vec!["rails"]);
+        assert_eq!(config.pypi, vec!["requests"]);
+        assert_eq!(config.crates, vec!["clap"]);
+        assert_eq!(config.review.provider, ReviewProvider::ClaudeCode);
+    }
+
+    #[test]
+    fn rejects_invalid_watchlist_fixture_from_disk() {
+        let error = WatchlistConfig::load_from_path(fixture_path("invalid-watchlist.yaml"))
+            .expect_err("invalid fixture config should fail validation");
+
+        assert!(matches!(error, ConfigError::Validation(_)));
+        let message = error.to_string();
+        assert!(message.contains("npm package `react` is listed more than once"));
+        assert!(message.contains("pypi package `has spaces` must not contain whitespace"));
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/config")
+            .join(name)
     }
 }
