@@ -12,6 +12,7 @@ use reqwest::{StatusCode, Url};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadPolicy {
     pub https_only: bool,
+    pub allowed_hosts: Vec<String>,
     pub max_redirects: usize,
     pub timeout: Duration,
     pub max_bytes: u64,
@@ -21,6 +22,7 @@ impl Default for DownloadPolicy {
     fn default() -> Self {
         Self {
             https_only: true,
+            allowed_hosts: Vec::new(),
             max_redirects: 5,
             timeout: Duration::from_secs(30),
             max_bytes: 50 * 1024 * 1024,
@@ -31,12 +33,47 @@ impl Default for DownloadPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
     pub url: String,
+    pub artifact_metadata: Option<ArtifactMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactMetadata {
+    pub filename: String,
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchResponse {
     pub final_url: String,
     pub bytes_written: u64,
+}
+
+impl ArtifactMetadata {
+    fn validate(&self) -> Result<(), FetchError> {
+        let filename = self.filename.trim();
+        if filename.is_empty() {
+            return Err(FetchError::InvalidArtifactMetadata {
+                reason: "artifact filename must not be empty".to_string(),
+            });
+        }
+
+        if filename.contains('/') || filename.contains('\\') || filename == "." || filename == ".."
+        {
+            return Err(FetchError::InvalidArtifactMetadata {
+                reason: format!("artifact filename `{filename}` must be a plain file name"),
+            });
+        }
+
+        if let Some(size_bytes) = self.size_bytes {
+            if size_bytes == 0 {
+                return Err(FetchError::InvalidArtifactMetadata {
+                    reason: "artifact size must be greater than zero when provided".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +103,10 @@ impl SafeDownloader {
         destination: impl AsRef<Path>,
     ) -> Result<FetchResponse, FetchError> {
         let destination = destination.as_ref();
+        if let Some(metadata) = request.artifact_metadata.as_ref() {
+            metadata.validate()?;
+        }
+
         let mut current_url =
             Url::parse(&request.url).map_err(|source| FetchError::InvalidUrl {
                 url: request.url.clone(),
@@ -132,7 +173,25 @@ impl SafeDownloader {
                 }
             }
 
+            if let Some(metadata) = request.artifact_metadata.as_ref() {
+                self.validate_final_url_against_artifact_metadata(&current_url, metadata)?;
+                self.validate_content_length_against_artifact_metadata(
+                    &current_url,
+                    response.content_length(),
+                    metadata,
+                )?;
+            }
+
             let fetch_response = self.write_response_body(&mut response, destination)?;
+            if let Some(metadata) = request.artifact_metadata.as_ref() {
+                self.validate_downloaded_size_against_artifact_metadata(
+                    &current_url,
+                    fetch_response,
+                    metadata,
+                    destination,
+                )?;
+            }
+
             return Ok(FetchResponse {
                 final_url: current_url.to_string(),
                 bytes_written: fetch_response,
@@ -142,14 +201,102 @@ impl SafeDownloader {
 
     fn validate_url(&self, url: &Url) -> Result<(), FetchError> {
         match url.scheme() {
-            "https" => Ok(()),
-            "http" if !self.policy.https_only => Ok(()),
-            scheme => Err(FetchError::UnsupportedScheme {
-                url: url.to_string(),
-                scheme: scheme.to_string(),
-                https_only: self.policy.https_only,
-            }),
+            "https" => {}
+            "http" if !self.policy.https_only => {}
+            scheme => {
+                return Err(FetchError::UnsupportedScheme {
+                    url: url.to_string(),
+                    scheme: scheme.to_string(),
+                    https_only: self.policy.https_only,
+                })
+            }
         }
+
+        if !self.policy.allowed_hosts.is_empty() {
+            let host = url.host_str().ok_or_else(|| FetchError::MissingHost {
+                url: url.to_string(),
+            })?;
+            let host_allowed = self
+                .policy
+                .allowed_hosts
+                .iter()
+                .any(|allowed_host| allowed_host.eq_ignore_ascii_case(host));
+            if !host_allowed {
+                return Err(FetchError::HostNotAllowed {
+                    url: url.to_string(),
+                    host: host.to_string(),
+                    allowed_hosts: self.policy.allowed_hosts.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_final_url_against_artifact_metadata(
+        &self,
+        url: &Url,
+        metadata: &ArtifactMetadata,
+    ) -> Result<(), FetchError> {
+        let actual_filename = url
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .filter(|segment| !segment.is_empty())
+            .ok_or_else(|| FetchError::ArtifactFilenameMismatch {
+                url: url.to_string(),
+                expected_filename: metadata.filename.clone(),
+                actual_filename: None,
+            })?;
+
+        if actual_filename != metadata.filename {
+            return Err(FetchError::ArtifactFilenameMismatch {
+                url: url.to_string(),
+                expected_filename: metadata.filename.clone(),
+                actual_filename: Some(actual_filename.to_string()),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn validate_content_length_against_artifact_metadata(
+        &self,
+        url: &Url,
+        content_length: Option<u64>,
+        metadata: &ArtifactMetadata,
+    ) -> Result<(), FetchError> {
+        if let (Some(expected), Some(actual)) = (metadata.size_bytes, content_length) {
+            if expected != actual {
+                return Err(FetchError::ArtifactSizeMismatch {
+                    url: url.to_string(),
+                    expected_size: expected,
+                    actual_size: actual,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_downloaded_size_against_artifact_metadata(
+        &self,
+        url: &Url,
+        bytes_written: u64,
+        metadata: &ArtifactMetadata,
+        destination: &Path,
+    ) -> Result<(), FetchError> {
+        if let Some(expected) = metadata.size_bytes {
+            if expected != bytes_written {
+                let _ = fs::remove_file(destination);
+                return Err(FetchError::ArtifactSizeMismatch {
+                    url: url.to_string(),
+                    expected_size: expected,
+                    actual_size: bytes_written,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     fn write_response_body(
@@ -226,6 +373,27 @@ pub enum FetchError {
         scheme: String,
         https_only: bool,
     },
+    MissingHost {
+        url: String,
+    },
+    HostNotAllowed {
+        url: String,
+        host: String,
+        allowed_hosts: Vec<String>,
+    },
+    InvalidArtifactMetadata {
+        reason: String,
+    },
+    ArtifactFilenameMismatch {
+        url: String,
+        expected_filename: String,
+        actual_filename: Option<String>,
+    },
+    ArtifactSizeMismatch {
+        url: String,
+        expected_size: u64,
+        actual_size: u64,
+    },
     RedirectLimitExceeded {
         url: String,
         limit: usize,
@@ -288,6 +456,46 @@ impl fmt::Display for FetchError {
                     write!(f, "download url `{url}` uses unsupported scheme `{scheme}`")
                 }
             }
+            Self::MissingHost { url } => {
+                write!(f, "download url `{url}` does not include a host")
+            }
+            Self::HostNotAllowed {
+                url,
+                host,
+                allowed_hosts,
+            } => write!(
+                f,
+                "download url `{url}` uses host `{host}` which is not in the allowlist [{}]",
+                allowed_hosts.join(", ")
+            ),
+            Self::InvalidArtifactMetadata { reason } => {
+                write!(f, "invalid artifact metadata: {reason}")
+            }
+            Self::ArtifactFilenameMismatch {
+                url,
+                expected_filename,
+                actual_filename,
+            } => {
+                if let Some(actual_filename) = actual_filename {
+                    write!(
+                        f,
+                        "download url `{url}` resolved to filename `{actual_filename}` but expected `{expected_filename}`"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "download url `{url}` does not resolve to a filename matching `{expected_filename}`"
+                    )
+                }
+            }
+            Self::ArtifactSizeMismatch {
+                url,
+                expected_size,
+                actual_size,
+            } => write!(
+                f,
+                "download for `{url}` does not match expected artifact size ({actual_size} != {expected_size} bytes)"
+            ),
             Self::RedirectLimitExceeded { url, limit } => {
                 write!(
                     f,
@@ -353,6 +561,11 @@ impl Error for FetchError {
             Self::Io { source, .. } => Some(source),
             Self::InvalidUrl { .. }
             | Self::UnsupportedScheme { .. }
+            | Self::MissingHost { .. }
+            | Self::HostNotAllowed { .. }
+            | Self::InvalidArtifactMetadata { .. }
+            | Self::ArtifactFilenameMismatch { .. }
+            | Self::ArtifactSizeMismatch { .. }
             | Self::RedirectLimitExceeded { .. }
             | Self::MissingRedirectLocation { .. }
             | Self::InvalidRedirectTarget { .. }
@@ -379,9 +592,7 @@ mod tests {
         let destination = TestDir::new("non-https").path().join("artifact.bin");
         let error = downloader
             .fetch_to_path(
-                &FetchRequest {
-                    url: "http://example.test/artifact.tgz".to_string(),
-                },
+                &request("http://example.test/artifact.tgz".to_string()),
                 &destination,
             )
             .expect_err("http url should be rejected");
@@ -393,6 +604,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_hosts_outside_allowlist() {
+        let mut policy = test_policy();
+        policy.allowed_hosts = vec!["example.test".to_string()];
+        let downloader = SafeDownloader::new(policy).expect("client should build");
+        let destination = TestDir::new("host-allowlist").path().join("artifact.bin");
+        let disallowed_url = "http://127.0.0.1:43210/artifact.bin".to_string();
+
+        let error = downloader
+            .fetch_to_path(&request(disallowed_url.clone()), &destination)
+            .expect_err("host outside allowlist should fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "download url `{disallowed_url}` uses host `127.0.0.1` which is not in the allowlist [example.test]"
+            )
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn downloads_body_within_limits() {
         let server = TestServer::start(vec![TestResponse::ok("hello world")]);
         let downloader = SafeDownloader::new(test_policy()).expect("client should build");
@@ -400,9 +632,7 @@ mod tests {
 
         let response = downloader
             .fetch_to_path(
-                &FetchRequest {
-                    url: format!("{}/artifact.bin", server.base_url()),
-                },
+                &request(format!("{}/artifact.bin", server.base_url())),
                 &destination,
             )
             .expect("download should succeed");
@@ -420,6 +650,85 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_artifact_metadata_before_download() {
+        let downloader = SafeDownloader::new(test_policy()).expect("client should build");
+        let destination = TestDir::new("invalid-metadata").path().join("artifact.bin");
+        let error = downloader
+            .fetch_to_path(
+                &request_with_artifact_metadata(
+                    "http://example.test/artifact.bin".to_string(),
+                    "nested/path.bin",
+                    Some(12),
+                ),
+                &destination,
+            )
+            .expect_err("invalid artifact metadata should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid artifact metadata: artifact filename `nested/path.bin` must be a plain file name"
+        );
+    }
+
+    #[test]
+    fn rejects_filename_mismatches_against_artifact_metadata() {
+        let server = TestServer::start(vec![TestResponse::ok("hello world")]);
+        let downloader = SafeDownloader::new(test_policy()).expect("client should build");
+        let destination = TestDir::new("filename-mismatch")
+            .path()
+            .join("artifact.bin");
+
+        let error = downloader
+            .fetch_to_path(
+                &request_with_artifact_metadata(
+                    format!("{}/artifact.bin", server.base_url()),
+                    "expected.bin",
+                    Some(11),
+                ),
+                &destination,
+            )
+            .expect_err("filename mismatch should fail");
+
+        let final_url = format!("{}/artifact.bin", server.base_url());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "download url `{final_url}` resolved to filename `artifact.bin` but expected `expected.bin`"
+            )
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn rejects_size_mismatches_against_artifact_metadata() {
+        let server = TestServer::start(vec![TestResponse::ok("hello world")]);
+        let downloader = SafeDownloader::new(test_policy()).expect("client should build");
+        let destination = TestDir::new("metadata-size-mismatch")
+            .path()
+            .join("artifact.bin");
+
+        let error = downloader
+            .fetch_to_path(
+                &request_with_artifact_metadata(
+                    format!("{}/artifact.bin", server.base_url()),
+                    "artifact.bin",
+                    Some(12),
+                ),
+                &destination,
+            )
+            .expect_err("artifact size mismatch should fail");
+
+        let final_url = format!("{}/artifact.bin", server.base_url());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "download for `{final_url}` does not match expected artifact size (11 != 12 bytes)"
+            )
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn follows_redirects_within_limit() {
         let server = TestServer::start(vec![
             TestResponse::redirect("/step-1"),
@@ -433,9 +742,7 @@ mod tests {
 
         let response = downloader
             .fetch_to_path(
-                &FetchRequest {
-                    url: format!("{}/start", server.base_url()),
-                },
+                &request(format!("{}/start", server.base_url())),
                 &destination,
             )
             .expect("redirected download should succeed");
@@ -464,9 +771,7 @@ mod tests {
 
         let error = downloader
             .fetch_to_path(
-                &FetchRequest {
-                    url: format!("{}/start", server.base_url()),
-                },
+                &request(format!("{}/start", server.base_url())),
                 &destination,
             )
             .expect_err("redirect limit should fail");
@@ -489,9 +794,7 @@ mod tests {
 
         let error = downloader
             .fetch_to_path(
-                &FetchRequest {
-                    url: format!("{}/artifact.bin", server.base_url()),
-                },
+                &request(format!("{}/artifact.bin", server.base_url())),
                 &destination,
             )
             .expect_err("size limit should fail");
@@ -517,9 +820,7 @@ mod tests {
 
         let error = downloader
             .fetch_to_path(
-                &FetchRequest {
-                    url: format!("{}/artifact.bin", server.base_url()),
-                },
+                &request(format!("{}/artifact.bin", server.base_url())),
                 &destination,
             )
             .expect_err("timeout should fail");
@@ -537,9 +838,31 @@ mod tests {
     fn test_policy() -> DownloadPolicy {
         DownloadPolicy {
             https_only: false,
+            allowed_hosts: Vec::new(),
             max_redirects: 5,
             timeout: Duration::from_secs(1),
             max_bytes: 1024,
+        }
+    }
+
+    fn request(url: String) -> FetchRequest {
+        FetchRequest {
+            url,
+            artifact_metadata: None,
+        }
+    }
+
+    fn request_with_artifact_metadata(
+        url: String,
+        filename: &str,
+        size_bytes: Option<u64>,
+    ) -> FetchRequest {
+        FetchRequest {
+            url,
+            artifact_metadata: Some(ArtifactMetadata {
+                filename: filename.to_string(),
+                size_bytes,
+            }),
         }
     }
 
