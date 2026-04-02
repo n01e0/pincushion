@@ -24,6 +24,7 @@ pub struct JsonReport {
     pub confidence: String,
     pub reasons: Vec<String>,
     pub focus_files: Vec<String>,
+    pub review_failure: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,7 @@ impl JsonReport {
             confidence: confidence_label(&input.review.confidence).to_string(),
             reasons: input.review.reasons.clone(),
             focus_files: input.review.focus_files.clone(),
+            review_failure: input.review.failure_reason.clone(),
         }
     }
 
@@ -255,6 +257,7 @@ mod tests {
             confidence: Confidence::High,
             reasons: vec!["new install script".to_string()],
             focus_files: vec!["package.json".to_string()],
+            failure_reason: None,
         };
         let report = JsonReport::from_analysis(JsonReportInput {
             status: "ok",
@@ -292,6 +295,7 @@ mod tests {
             confidence: Confidence::Medium,
             reasons: vec!["entrypoint changed".to_string()],
             focus_files: vec!["package.json".to_string()],
+            failure_reason: Some("review backend timed out".to_string()),
         };
         let report = JsonReport::from_analysis(JsonReportInput {
             status: "ok",
@@ -323,6 +327,7 @@ mod tests {
         assert_eq!(value["package"], "@types/node");
         assert_eq!(value["summary"]["signals"][0], "entrypoint-changed");
         assert_eq!(value["verdict"], "needs-review");
+        assert_eq!(value["review_failure"], "review backend timed out");
     }
 
     struct TestDir {
