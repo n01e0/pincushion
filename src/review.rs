@@ -100,6 +100,13 @@ pub struct ReviewOutput {
     pub confidence: Confidence,
     pub reasons: Vec<String>,
     pub focus_files: Vec<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDecision {
+    pub status: String,
+    pub output: ReviewOutput,
 }
 
 impl ReviewOutput {
@@ -156,6 +163,7 @@ impl Reviewer for NoneReviewer {
                 "review backend is disabled (provider=none); manual review required".to_string(),
             ],
             focus_files,
+            failure_reason: None,
         })
     }
 }
@@ -278,6 +286,16 @@ impl ReviewBackend {
             Self::None(reviewer) => reviewer.review(input),
             Self::Codex(reviewer) => reviewer.review(input),
             Self::ClaudeCode(reviewer) => reviewer.review(input),
+        }
+    }
+
+    pub fn review_fail_closed(&self, input: &ReviewInput) -> ReviewDecision {
+        match self.review(input) {
+            Ok(output) => ReviewDecision {
+                status: String::from("ok"),
+                output,
+            },
+            Err(error) => fail_closed_review_decision(input, &error),
         }
     }
 }
@@ -451,6 +469,25 @@ fn review_provider_label(provider: &ReviewProvider) -> &'static str {
         ReviewProvider::None => "none",
         ReviewProvider::Codex => "codex",
         ReviewProvider::ClaudeCode => "claude-code",
+    }
+}
+
+fn fail_closed_review_decision(input: &ReviewInput, error: &ReviewBackendError) -> ReviewDecision {
+    ReviewDecision {
+        status: String::from("human-review-required"),
+        output: ReviewOutput {
+            verdict: ReviewVerdict::Suspicious,
+            confidence: Confidence::High,
+            reasons: vec![format!(
+                "review backend failure requires manual review: {error}"
+            )],
+            focus_files: input
+                .interesting_files
+                .iter()
+                .map(|excerpt| excerpt.path.clone())
+                .collect(),
+            failure_reason: Some(error.to_string()),
+        },
     }
 }
 
@@ -638,6 +675,7 @@ mod tests {
             confidence: Confidence::Medium,
             reasons: vec!["no suspicious changes detected".to_string()],
             focus_files: vec!["README.md".to_string()],
+            failure_reason: None,
         };
 
         let json = output
