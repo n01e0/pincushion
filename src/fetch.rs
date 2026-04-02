@@ -9,6 +9,9 @@ use reqwest::blocking::Client;
 use reqwest::header::LOCATION;
 use reqwest::{StatusCode, Url};
 
+use crate::registry::{DownloadedArtifact, PackageVersion};
+use crate::state::StateLayout;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadPolicy {
     pub https_only: bool,
@@ -48,6 +51,12 @@ pub struct FetchResponse {
     pub bytes_written: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedArtifact {
+    pub artifact: DownloadedArtifact,
+    pub cache_hit: bool,
+}
+
 impl ArtifactMetadata {
     fn validate(&self) -> Result<(), FetchError> {
         let filename = self.filename.trim();
@@ -76,10 +85,108 @@ impl ArtifactMetadata {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactCache {
+    root: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct SafeDownloader {
     policy: DownloadPolicy,
     client: Client,
+}
+
+impl ArtifactCache {
+    pub fn new(root: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn from_state_layout(state_layout: &StateLayout) -> Self {
+        Self::new(state_layout.artifacts_dir())
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn path_for(
+        &self,
+        package_version: &PackageVersion,
+        metadata: &ArtifactMetadata,
+    ) -> Result<PathBuf, FetchError> {
+        metadata.validate()?;
+        Ok(self
+            .root
+            .join(package_version.ecosystem.as_str())
+            .join(sanitize_cache_path_component(&package_version.package))
+            .join(sanitize_cache_path_component(&package_version.version))
+            .join(&metadata.filename))
+    }
+
+    pub fn fetch(
+        &self,
+        downloader: &SafeDownloader,
+        package_version: &PackageVersion,
+        request: &FetchRequest,
+    ) -> Result<CachedArtifact, FetchError> {
+        let metadata = request.artifact_metadata.as_ref().ok_or_else(|| {
+            FetchError::MissingArtifactMetadata {
+                url: request.url.clone(),
+            }
+        })?;
+        let cache_path = self.path_for(package_version, metadata)?;
+
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| FetchError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        if let Ok(existing_metadata) = fs::metadata(&cache_path) {
+            let size_matches = metadata
+                .size_bytes
+                .is_none_or(|expected_size| existing_metadata.len() == expected_size);
+            if size_matches {
+                return Ok(CachedArtifact {
+                    artifact: DownloadedArtifact {
+                        source_url: Some(request.url.clone()),
+                        path: cache_path,
+                    },
+                    cache_hit: true,
+                });
+            }
+
+            let _ = fs::remove_file(&cache_path);
+        }
+
+        let temporary_path = cache_path.with_extension("partial");
+        let response = match downloader.fetch_to_path(request, &temporary_path) {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path);
+                return Err(error);
+            }
+        };
+
+        if let Err(source) = fs::rename(&temporary_path, &cache_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(FetchError::Io {
+                path: cache_path.clone(),
+                source,
+            });
+        }
+
+        Ok(CachedArtifact {
+            artifact: DownloadedArtifact {
+                source_url: Some(response.final_url),
+                path: cache_path,
+            },
+            cache_hit: false,
+        })
+    }
 }
 
 impl SafeDownloader {
@@ -361,6 +468,25 @@ impl SafeDownloader {
     }
 }
 
+fn sanitize_cache_path_component(component: &str) -> String {
+    let mut sanitized = String::with_capacity(component.len());
+
+    for byte in component.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                sanitized.push(byte as char);
+            }
+            _ => sanitized.push_str(&format!("~{byte:02X}")),
+        }
+    }
+
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
 #[derive(Debug)]
 pub enum FetchError {
     ClientBuild(reqwest::Error),
@@ -383,6 +509,9 @@ pub enum FetchError {
     },
     InvalidArtifactMetadata {
         reason: String,
+    },
+    MissingArtifactMetadata {
+        url: String,
     },
     ArtifactFilenameMismatch {
         url: String,
@@ -470,6 +599,9 @@ impl fmt::Display for FetchError {
             ),
             Self::InvalidArtifactMetadata { reason } => {
                 write!(f, "invalid artifact metadata: {reason}")
+            }
+            Self::MissingArtifactMetadata { url } => {
+                write!(f, "download request for `{url}` is missing artifact metadata")
             }
             Self::ArtifactFilenameMismatch {
                 url,
@@ -564,6 +696,7 @@ impl Error for FetchError {
             | Self::MissingHost { .. }
             | Self::HostNotAllowed { .. }
             | Self::InvalidArtifactMetadata { .. }
+            | Self::MissingArtifactMetadata { .. }
             | Self::ArtifactFilenameMismatch { .. }
             | Self::ArtifactSizeMismatch { .. }
             | Self::RedirectLimitExceeded { .. }
@@ -582,6 +715,8 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    use crate::registry::Ecosystem;
 
     use super::*;
 
@@ -835,6 +970,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn computes_cache_paths_inside_state_layout() {
+        let repo_root = TestDir::new("cache-layout");
+        let state_layout =
+            StateLayout::from_repo_root(repo_root.path()).expect("state layout should build");
+        let cache = ArtifactCache::from_state_layout(&state_layout);
+        let package_version = package_version(Ecosystem::Npm, "@types/node", "24.0.0");
+        let metadata = ArtifactMetadata {
+            filename: "node.tgz".to_string(),
+            size_bytes: Some(42),
+        };
+
+        let path = cache
+            .path_for(&package_version, &metadata)
+            .expect("cache path should build");
+
+        assert_eq!(
+            path,
+            state_layout
+                .artifacts_dir()
+                .join("npm")
+                .join("~40types~2Fnode")
+                .join("24.0.0")
+                .join("node.tgz")
+        );
+    }
+
+    #[test]
+    fn serves_repeated_downloads_from_cache() {
+        let repo_root = TestDir::new("cache-hit");
+        let state_layout =
+            StateLayout::from_repo_root(repo_root.path()).expect("state layout should build");
+        let cache = ArtifactCache::from_state_layout(&state_layout);
+        let server = TestServer::start(vec![TestResponse::ok("hello")]);
+        let downloader = SafeDownloader::new(test_policy()).expect("client should build");
+        let package_version = package_version(Ecosystem::Npm, "chalk", "5.4.0");
+        let request = request_with_artifact_metadata(
+            format!("{}/chalk-5.4.0.tgz", server.base_url()),
+            "chalk-5.4.0.tgz",
+            Some(5),
+        );
+
+        let first = cache
+            .fetch(&downloader, &package_version, &request)
+            .expect("first fetch should succeed");
+        let second = cache
+            .fetch(&downloader, &package_version, &request)
+            .expect("second fetch should hit cache");
+
+        assert!(!first.cache_hit);
+        assert!(second.cache_hit);
+        assert_eq!(first.artifact.path, second.artifact.path);
+        assert_eq!(
+            fs::read_to_string(&second.artifact.path).expect("cached file should exist"),
+            "hello"
+        );
+        assert_eq!(server.paths(), vec!["/chalk-5.4.0.tgz"]);
+    }
+
+    #[test]
+    fn redownloads_stale_cached_artifacts() {
+        let repo_root = TestDir::new("cache-stale");
+        let state_layout =
+            StateLayout::from_repo_root(repo_root.path()).expect("state layout should build");
+        let cache = ArtifactCache::from_state_layout(&state_layout);
+        let downloader = SafeDownloader::new(test_policy()).expect("client should build");
+        let package_version = package_version(Ecosystem::Pypi, "requests", "2.32.3");
+        let metadata = ArtifactMetadata {
+            filename: "requests-2.32.3.tar.gz".to_string(),
+            size_bytes: Some(12),
+        };
+        let stale_path = cache
+            .path_for(&package_version, &metadata)
+            .expect("cache path should build");
+        fs::create_dir_all(
+            stale_path
+                .parent()
+                .expect("cache path should have a parent"),
+        )
+        .expect("cache directories should be created");
+        fs::write(&stale_path, b"stale").expect("stale cache entry should be written");
+
+        let server = TestServer::start(vec![TestResponse::ok("fresh-bytes!")]);
+        let request = request_with_artifact_metadata(
+            format!("{}/requests-2.32.3.tar.gz", server.base_url()),
+            "requests-2.32.3.tar.gz",
+            Some(12),
+        );
+
+        let fetched = cache
+            .fetch(&downloader, &package_version, &request)
+            .expect("stale artifact should be refreshed");
+
+        assert!(!fetched.cache_hit);
+        assert_eq!(
+            fs::read_to_string(&fetched.artifact.path).expect("refreshed cache file should exist"),
+            "fresh-bytes!"
+        );
+        assert_eq!(server.paths(), vec!["/requests-2.32.3.tar.gz"]);
+    }
+
     fn test_policy() -> DownloadPolicy {
         DownloadPolicy {
             https_only: false,
@@ -863,6 +1099,14 @@ mod tests {
                 filename: filename.to_string(),
                 size_bytes,
             }),
+        }
+    }
+
+    fn package_version(ecosystem: Ecosystem, package: &str, version: &str) -> PackageVersion {
+        PackageVersion {
+            ecosystem,
+            package: package.to_string(),
+            version: version.to_string(),
         }
     }
 
