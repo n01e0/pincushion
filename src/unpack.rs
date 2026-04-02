@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
+use zip::ZipArchive;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnpackLimits {
@@ -185,6 +186,117 @@ impl SafeUnpacker {
         destination: impl AsRef<Path>,
     ) -> Result<UnpackStats, UnpackError> {
         self.unpack_tar_gz(artifact, destination)
+    }
+
+    pub fn unpack_zip(
+        &self,
+        artifact: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<UnpackStats, UnpackError> {
+        let artifact = artifact.as_ref();
+        let destination = destination.as_ref();
+        fs::create_dir_all(destination).map_err(|source| UnpackError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+
+        let file = File::open(artifact).map_err(|source| UnpackError::Io {
+            path: artifact.to_path_buf(),
+            source,
+        })?;
+        let mut archive = ZipArchive::new(file).map_err(|source| UnpackError::ArchiveRead {
+            path: artifact.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, source),
+        })?;
+        let mut stats = UnpackStats::default();
+
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|source| UnpackError::ArchiveRead {
+                    path: artifact.to_path_buf(),
+                    source: io::Error::new(io::ErrorKind::InvalidData, source),
+                })?;
+            let relative_path = self.validate_entry_path(Path::new(entry.name()))?;
+            let output_path = destination.join(&relative_path);
+
+            if entry.is_dir() {
+                fs::create_dir_all(&output_path).map_err(|source| UnpackError::Io {
+                    path: output_path.clone(),
+                    source,
+                })?;
+                stats.directories_created += 1;
+                continue;
+            }
+
+            if entry
+                .unix_mode()
+                .is_some_and(|mode| matches!(mode & 0o170000, 0o120000 | 0o060000))
+            {
+                if self.plan.materialize_links {
+                    return Err(UnpackError::UnsupportedEntryType {
+                        path: relative_path,
+                        entry_type: "link".to_string(),
+                    });
+                }
+
+                return Err(UnpackError::LinkEntryRejected {
+                    path: relative_path,
+                });
+            }
+
+            if stats.files_written >= self.plan.limits.max_files {
+                return Err(UnpackError::FileCountLimitExceeded {
+                    limit: self.plan.limits.max_files,
+                });
+            }
+
+            let entry_size = entry.size();
+            if entry_size > self.plan.limits.max_single_file_bytes {
+                return Err(UnpackError::SingleFileLimitExceeded {
+                    path: relative_path,
+                    limit: self.plan.limits.max_single_file_bytes,
+                    attempted: entry_size,
+                });
+            }
+
+            let total_after_write = stats.total_bytes_written.saturating_add(entry_size);
+            if total_after_write > self.plan.limits.max_total_bytes {
+                return Err(UnpackError::TotalSizeLimitExceeded {
+                    limit: self.plan.limits.max_total_bytes,
+                    attempted: total_after_write,
+                });
+            }
+
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent).map_err(|source| UnpackError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+
+            let mut output = File::create(&output_path).map_err(|source| UnpackError::Io {
+                path: output_path.clone(),
+                source,
+            })?;
+            io::copy(&mut entry, &mut output).map_err(|source| UnpackError::Io {
+                path: output_path.clone(),
+                source,
+            })?;
+
+            stats.files_written += 1;
+            stats.total_bytes_written = total_after_write;
+        }
+
+        Ok(stats)
+    }
+
+    pub fn unpack_wheel(
+        &self,
+        artifact: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<UnpackStats, UnpackError> {
+        self.unpack_zip(artifact, destination)
     }
 
     fn validate_entry_path(&self, path: &Path) -> Result<PathBuf, UnpackError> {
@@ -368,6 +480,8 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use tar::{Builder, EntryType, Header};
+    use zip::write::FileOptions;
+    use zip::ZipWriter;
 
     use super::*;
 
@@ -422,6 +536,59 @@ mod tests {
         assert_eq!(stats.files_written, 1);
         assert_eq!(stats.total_bytes_written, 24);
         assert!(destination.join("crate/Cargo.toml").exists());
+    }
+
+    #[test]
+    fn unpacks_zip_files_and_directories() {
+        let temp = TestDir::new("zip");
+        let artifact = temp.path().join("package.zip");
+        let destination = temp.path().join("out");
+        write_zip_archive(
+            &artifact,
+            vec![
+                ArchiveEntry::directory("package/"),
+                ArchiveEntry::file("package/README.md", b"hello"),
+                ArchiveEntry::file("package/src/lib.rs", b"pub fn hi() {}\n"),
+            ],
+        );
+
+        let stats = SafeUnpacker::default()
+            .unpack_zip(&artifact, &destination)
+            .expect("zip should unpack");
+
+        assert_eq!(stats.files_written, 2);
+        assert_eq!(stats.directories_created, 1);
+        assert_eq!(stats.total_bytes_written, 20);
+        assert_eq!(
+            fs::read_to_string(destination.join("package/README.md")).expect("readme should exist"),
+            "hello"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("package/src/lib.rs")).expect("lib should exist"),
+            "pub fn hi() {}\n"
+        );
+    }
+
+    #[test]
+    fn unpacks_wheel_archives_with_same_logic() {
+        let temp = TestDir::new("wheel");
+        let artifact = temp.path().join("package.whl");
+        let destination = temp.path().join("out");
+        write_zip_archive(
+            &artifact,
+            vec![ArchiveEntry::file(
+                "demo/__init__.py",
+                b"__version__ = '0.1.0'\n",
+            )],
+        );
+
+        let stats = SafeUnpacker::default()
+            .unpack_wheel(&artifact, &destination)
+            .expect("wheel should unpack");
+
+        assert_eq!(stats.files_written, 1);
+        assert_eq!(stats.total_bytes_written, 22);
+        assert!(destination.join("demo/__init__.py").exists());
     }
 
     #[test]
@@ -541,6 +708,78 @@ mod tests {
         assert_eq!(error.to_string(), "archive exceeds file-count limit of 1");
     }
 
+    #[test]
+    fn rejects_absolute_paths_in_zip_archives() {
+        let temp = TestDir::new("zip-absolute");
+        let artifact = temp.path().join("bad.zip");
+        write_zip_archive(&artifact, vec![ArchiveEntry::file("/etc/passwd", b"root")]);
+
+        let error = SafeUnpacker::default()
+            .unpack_zip(&artifact, temp.path().join("out"))
+            .expect_err("absolute zip path should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "archive entry `/etc/passwd` uses an absolute path"
+        );
+    }
+
+    #[test]
+    fn rejects_parent_path_traversal_in_zip_archives() {
+        let temp = TestDir::new("zip-parent");
+        let artifact = temp.path().join("bad.zip");
+        write_zip_archive(
+            &artifact,
+            vec![ArchiveEntry::file("pkg/../escape.txt", b"oops")],
+        );
+
+        let error = SafeUnpacker::default()
+            .unpack_zip(&artifact, temp.path().join("out"))
+            .expect_err("zip parent traversal should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "archive entry `pkg/../escape.txt` contains parent path traversal"
+        );
+    }
+
+    #[test]
+    fn rejects_link_entries_in_zip_archives() {
+        let temp = TestDir::new("zip-symlink");
+        let artifact = temp.path().join("bad.zip");
+        write_zip_archive(&artifact, vec![ArchiveEntry::symlink("pkg/link", "target")]);
+
+        let error = SafeUnpacker::default()
+            .unpack_zip(&artifact, temp.path().join("out"))
+            .expect_err("zip symlink should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "archive entry `pkg/link` is a symlink or hard link"
+        );
+    }
+
+    #[test]
+    fn enforces_single_file_size_limit_in_zip_archives() {
+        let temp = TestDir::new("zip-single-limit");
+        let artifact = temp.path().join("bad.zip");
+        write_zip_archive(
+            &artifact,
+            vec![ArchiveEntry::file("pkg/huge.bin", &[0_u8; 8])],
+        );
+        let mut plan = UnpackPlan::default();
+        plan.limits.max_single_file_bytes = 4;
+
+        let error = SafeUnpacker::new(plan)
+            .unpack_zip(&artifact, temp.path().join("out"))
+            .expect_err("zip single-file limit should be enforced");
+
+        assert_eq!(
+            error.to_string(),
+            "archive entry `pkg/huge.bin` exceeds single-file limit (8 > 4 bytes)"
+        );
+    }
+
     fn write_archive(path: &Path, entries: Vec<ArchiveEntry<'_>>) {
         let file = File::create(path).expect("archive file should be created");
         let encoder = GzEncoder::new(file, Compression::default());
@@ -587,6 +826,76 @@ mod tests {
 
         let encoder = builder.into_inner().expect("builder should finish");
         encoder.finish().expect("encoder should finish");
+    }
+
+    fn write_zip_archive(path: &Path, entries: Vec<ArchiveEntry<'_>>) {
+        let file = File::create(path).expect("zip file should be created");
+        let mut writer = ZipWriter::new(file);
+        let mut symlink_entries = Vec::new();
+
+        for entry in entries {
+            match entry {
+                ArchiveEntry::Directory(path) => {
+                    writer
+                        .add_directory(path, FileOptions::default().unix_permissions(0o755))
+                        .expect("directory entry should be appended");
+                }
+                ArchiveEntry::File(path, contents) => {
+                    writer
+                        .start_file(path, FileOptions::default().unix_permissions(0o644))
+                        .expect("file entry should be appended");
+                    std::io::Write::write_all(&mut writer, contents)
+                        .expect("zip file contents should be written");
+                }
+                ArchiveEntry::Symlink(path, target) => {
+                    symlink_entries.push(path.to_string());
+                    writer
+                        .start_file(path, FileOptions::default().unix_permissions(0o777))
+                        .expect("symlink entry should be appended");
+                    std::io::Write::write_all(&mut writer, target.as_bytes())
+                        .expect("zip link contents should be written");
+                }
+            }
+        }
+
+        writer.finish().expect("zip writer should finish");
+
+        if !symlink_entries.is_empty() {
+            patch_zip_symlink_attributes(path, &symlink_entries);
+        }
+    }
+
+    fn patch_zip_symlink_attributes(path: &Path, symlink_entries: &[String]) {
+        let mut bytes = fs::read(path).expect("zip bytes should be readable");
+        let mut offset = 0usize;
+
+        while offset + 46 <= bytes.len() {
+            if bytes[offset..].starts_with(&[0x50, 0x4B, 0x01, 0x02]) {
+                let name_len =
+                    u16::from_le_bytes([bytes[offset + 28], bytes[offset + 29]]) as usize;
+                let extra_len =
+                    u16::from_le_bytes([bytes[offset + 30], bytes[offset + 31]]) as usize;
+                let comment_len =
+                    u16::from_le_bytes([bytes[offset + 32], bytes[offset + 33]]) as usize;
+                let name_start = offset + 46;
+                let name_end = name_start + name_len;
+                let name = String::from_utf8_lossy(&bytes[name_start..name_end]);
+
+                if symlink_entries.iter().any(|entry| entry == &name) {
+                    let version_made_by = (3_u16 << 8) | 20;
+                    bytes[offset + 4..offset + 6].copy_from_slice(&version_made_by.to_le_bytes());
+                    let external_attributes = (0o120777_u32) << 16;
+                    bytes[offset + 38..offset + 42]
+                        .copy_from_slice(&external_attributes.to_le_bytes());
+                }
+
+                offset = name_end + extra_len + comment_len;
+            } else {
+                offset += 1;
+            }
+        }
+
+        fs::write(path, bytes).expect("patched zip bytes should be written");
     }
 
     fn set_header_path_unchecked(header: &mut Header, path: &str) {
