@@ -34,15 +34,15 @@ fn main() -> ExitCode {
     let mut stderr = io::stderr();
 
     match run_app(env::args_os(), &mut stdout) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(error) => {
             let _ = writeln!(stderr, "error: {error}");
-            ExitCode::FAILURE
+            error.exit_code()
         }
     }
 }
 
-fn run_app<I, S, W>(args: I, stdout: &mut W) -> Result<(), AppError>
+fn run_app<I, S, W>(args: I, stdout: &mut W) -> Result<ExitCode, AppError>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -51,12 +51,13 @@ where
     match parse_args(args)? {
         CliCommand::Help => {
             write!(stdout, "{USAGE}").map_err(AppError::Output)?;
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         CliCommand::Check { config_path } => {
             execute_check_with_lookup(&config_path, stdout, |config| {
                 RegistryAdapters::default().lookup_latest_versions(config)
             })
+            .map(CheckOutcome::exit_code)
         }
     }
 }
@@ -65,7 +66,7 @@ fn execute_check_with_lookup<W, F>(
     config_path: &Path,
     stdout: &mut W,
     lookup_latest_versions: F,
-) -> Result<(), AppError>
+) -> Result<CheckOutcome, AppError>
 where
     W: Write,
     F: FnOnce(&WatchlistConfig) -> Vec<RegistryLookupResult>,
@@ -97,6 +98,11 @@ where
     )
     .map_err(AppError::Output)?;
 
+    let outcome = CheckOutcome {
+        partial_failures: lookup_failures.len(),
+        ..CheckOutcome::default()
+    };
+
     if !lookup_failures.is_empty() {
         writeln!(
             stdout,
@@ -107,9 +113,15 @@ where
         for (package_key, error) in &lookup_failures {
             writeln!(stdout, "  - {package_key}: {error}").map_err(AppError::Output)?;
         }
-        return Err(AppError::LookupFailed {
-            failed: lookup_failures.len(),
-        });
+    }
+
+    if current_versions.is_empty() {
+        writeln!(
+            stdout,
+            "No package versions were resolved; skipping state update."
+        )
+        .map_err(AppError::Output)?;
+        return Ok(outcome);
     }
 
     match state_layout
@@ -118,7 +130,7 @@ where
     {
         BaselineState::Initialized(seen_state) => {
             print_baseline_summary(stdout, &state_layout, &seen_state)?;
-            Ok(())
+            Ok(outcome)
         }
         BaselineState::Existing(previous_seen_state) => {
             let detection = previous_seen_state.detect_changes(&current_versions);
@@ -127,7 +139,7 @@ where
                 .save_seen_state(&next_seen_state)
                 .map_err(AppError::State)?;
             print_change_summary(stdout, &state_layout, &detection)?;
-            Ok(())
+            Ok(outcome)
         }
     }
 }
@@ -297,13 +309,47 @@ where
     Ok(CliCommand::Check { config_path })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CheckOutcome {
+    suspicious_packages: usize,
+    partial_failures: usize,
+}
+
+impl CheckOutcome {
+    fn exit_code(self) -> ExitCode {
+        if self.partial_failures > 0 {
+            return ExitCode::from(ExitCodePolicy::PartialFailure.code());
+        }
+
+        if self.suspicious_packages > 0 {
+            return ExitCode::from(ExitCodePolicy::SuspiciousFound.code());
+        }
+
+        ExitCode::SUCCESS
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitCodePolicy {
+    SuspiciousFound,
+    PartialFailure,
+}
+
+impl ExitCodePolicy {
+    const fn code(self) -> u8 {
+        match self {
+            Self::SuspiciousFound => 10,
+            Self::PartialFailure => 20,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum AppError {
     Cli(CliError),
     Config(ConfigError),
     StateLayout { path: PathBuf, source: io::Error },
     State(StateError),
-    LookupFailed { failed: usize },
     Output(io::Error),
 }
 
@@ -318,7 +364,6 @@ impl fmt::Display for AppError {
                 path.display()
             ),
             Self::State(error) => write!(f, "{error}"),
-            Self::LookupFailed { failed } => write!(f, "{failed} package lookup(s) failed"),
             Self::Output(error) => write!(f, "failed to write CLI output: {error}"),
         }
     }
@@ -331,9 +376,14 @@ impl Error for AppError {
             Self::Config(error) => Some(error),
             Self::StateLayout { source, .. } => Some(source),
             Self::State(error) => Some(error),
-            Self::LookupFailed { .. } => None,
             Self::Output(error) => Some(error),
         }
+    }
+}
+
+impl AppError {
+    fn exit_code(&self) -> ExitCode {
+        ExitCode::FAILURE
     }
 }
 
@@ -369,7 +419,7 @@ mod tests {
         Ecosystem, PackageCoordinate, PackageVersion, RegistryError, RegistryLookupResult,
     };
 
-    use super::{execute_check_with_lookup, parse_args, AppError, CliCommand};
+    use super::{execute_check_with_lookup, parse_args, CheckOutcome, CliCommand, ExitCodePolicy};
 
     #[test]
     fn parses_check_command_with_config_path() {
@@ -400,10 +450,12 @@ mod tests {
         fixture.write_config("npm:\n  - react\nreview:\n  provider: none\n");
 
         let mut stdout = Vec::new();
-        execute_check_with_lookup(fixture.config_path(), &mut stdout, |_config| {
+        let outcome = execute_check_with_lookup(fixture.config_path(), &mut stdout, |_config| {
             vec![lookup_success(Ecosystem::Npm, "react", "19.1.0")]
         })
         .expect("baseline run should succeed");
+
+        assert_eq!(outcome.exit_code(), std::process::ExitCode::SUCCESS);
 
         let output = String::from_utf8(stdout).expect("stdout should be utf8");
         assert!(output.contains("Initialized baseline at"));
@@ -426,7 +478,7 @@ mod tests {
         );
 
         let mut stdout = Vec::new();
-        execute_check_with_lookup(fixture.config_path(), &mut stdout, |_config| {
+        let outcome = execute_check_with_lookup(fixture.config_path(), &mut stdout, |_config| {
             vec![
                 lookup_success(Ecosystem::Npm, "react", "19.1.0"),
                 lookup_success(Ecosystem::Crates, "clap", "4.5.31"),
@@ -434,6 +486,8 @@ mod tests {
             ]
         })
         .expect("follow-up run should succeed");
+
+        assert_eq!(outcome.exit_code(), std::process::ExitCode::SUCCESS);
 
         let output = String::from_utf8(stdout).expect("stdout should be utf8");
         assert!(output.contains("Detected 1 changed, 1 unchanged, and 1 newly tracked package(s)."));
@@ -450,26 +504,77 @@ mod tests {
     }
 
     #[test]
-    fn reports_lookup_failures_without_persisting_partial_state() {
+    fn reports_lookup_failures_as_partial_failure_and_persists_successful_versions() {
         let fixture = TestFixture::new("lookup-failure");
         fixture.write_config("npm:\n  - react\npypi:\n  - requests\nreview:\n  provider: none\n");
 
         let mut stdout = Vec::new();
-        let error = execute_check_with_lookup(fixture.config_path(), &mut stdout, |_config| {
+        let outcome = execute_check_with_lookup(fixture.config_path(), &mut stdout, |_config| {
             vec![
                 lookup_success(Ecosystem::Npm, "react", "19.1.0"),
                 lookup_failure(Ecosystem::Pypi, "requests", "timeout"),
             ]
         })
-        .expect_err("lookup failure should stop the run");
+        .expect("partial failure run should still complete");
 
-        assert!(matches!(error, AppError::LookupFailed { failed: 1 }));
+        assert_eq!(
+            outcome.exit_code(),
+            std::process::ExitCode::from(ExitCodePolicy::PartialFailure.code())
+        );
 
         let output = String::from_utf8(stdout).expect("stdout should be utf8");
         assert!(output.contains("Resolved 1 package(s) successfully."));
         assert!(output.contains("Failed to resolve 1 package(s):"));
         assert!(output.contains("pypi:requests: timeout"));
+        assert!(output.contains("Initialized baseline at"));
+
+        let seen_contents = fs::read_to_string(fixture.seen_file_path())
+            .expect("successful lookups should still update seen state");
+        assert!(seen_contents.contains("\"npm:react\": \"19.1.0\""));
+        assert!(!seen_contents.contains("pypi:requests"));
+    }
+
+    #[test]
+    fn returns_partial_failure_when_all_package_lookups_fail() {
+        let fixture = TestFixture::new("all-lookup-failure");
+        fixture.write_config("npm:\n  - react\nreview:\n  provider: none\n");
+
+        let mut stdout = Vec::new();
+        let outcome = execute_check_with_lookup(fixture.config_path(), &mut stdout, |_config| {
+            vec![lookup_failure(Ecosystem::Npm, "react", "timeout")]
+        })
+        .expect("all-failure run should still complete");
+
+        assert_eq!(
+            outcome.exit_code(),
+            std::process::ExitCode::from(ExitCodePolicy::PartialFailure.code())
+        );
+
+        let output = String::from_utf8(stdout).expect("stdout should be utf8");
+        assert!(output.contains("Resolved 0 package(s) successfully."));
+        assert!(output.contains("No package versions were resolved; skipping state update."));
         assert!(!fixture.seen_file_path().exists());
+    }
+
+    #[test]
+    fn exit_code_policy_prioritizes_partial_failure_over_suspicious_results() {
+        let partial_failure = CheckOutcome {
+            suspicious_packages: 1,
+            partial_failures: 1,
+        };
+        let suspicious_only = CheckOutcome {
+            suspicious_packages: 1,
+            partial_failures: 0,
+        };
+
+        assert_eq!(
+            partial_failure.exit_code(),
+            std::process::ExitCode::from(ExitCodePolicy::PartialFailure.code())
+        );
+        assert_eq!(
+            suspicious_only.exit_code(),
+            std::process::ExitCode::from(ExitCodePolicy::SuspiciousFound.code())
+        );
     }
 
     fn lookup_success(ecosystem: Ecosystem, package: &str, version: &str) -> RegistryLookupResult {
