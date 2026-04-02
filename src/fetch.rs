@@ -137,6 +137,7 @@ impl ArtifactCache {
             }
         })?;
         let cache_path = self.path_for(package_version, metadata)?;
+        downloader.validate_destination_path(&cache_path)?;
 
         if let Some(parent) = cache_path.parent() {
             fs::create_dir_all(parent).map_err(|source| FetchError::Io {
@@ -210,6 +211,7 @@ impl SafeDownloader {
         destination: impl AsRef<Path>,
     ) -> Result<FetchResponse, FetchError> {
         let destination = destination.as_ref();
+        self.validate_destination_path(destination)?;
         if let Some(metadata) = request.artifact_metadata.as_ref() {
             metadata.validate()?;
         }
@@ -335,6 +337,32 @@ impl SafeDownloader {
                     allowed_hosts: self.policy.allowed_hosts.clone(),
                 });
             }
+        }
+
+        Ok(())
+    }
+
+    fn validate_destination_path(&self, destination: &Path) -> Result<(), FetchError> {
+        let mut current = Some(destination);
+
+        while let Some(path) = current {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(FetchError::SymlinkPathRejected {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Ok(_) => {}
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(FetchError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+
+            current = path.parent();
         }
 
         Ok(())
@@ -510,6 +538,9 @@ pub enum FetchError {
     InvalidArtifactMetadata {
         reason: String,
     },
+    SymlinkPathRejected {
+        path: PathBuf,
+    },
     MissingArtifactMetadata {
         url: String,
     },
@@ -599,6 +630,9 @@ impl fmt::Display for FetchError {
             ),
             Self::InvalidArtifactMetadata { reason } => {
                 write!(f, "invalid artifact metadata: {reason}")
+            }
+            Self::SymlinkPathRejected { path } => {
+                write!(f, "refusing to use symlink path {}", path.display())
             }
             Self::MissingArtifactMetadata { url } => {
                 write!(f, "download request for `{url}` is missing artifact metadata")
@@ -696,6 +730,7 @@ impl Error for FetchError {
             | Self::MissingHost { .. }
             | Self::HostNotAllowed { .. }
             | Self::InvalidArtifactMetadata { .. }
+            | Self::SymlinkPathRejected { .. }
             | Self::MissingArtifactMetadata { .. }
             | Self::ArtifactFilenameMismatch { .. }
             | Self::ArtifactSizeMismatch { .. }
@@ -719,6 +754,9 @@ mod tests {
     use crate::registry::Ecosystem;
 
     use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn rejects_non_https_urls_by_default() {
@@ -943,6 +981,59 @@ mod tests {
     }
 
     #[test]
+    fn rejects_streamed_bodies_larger_than_limit_without_content_length() {
+        let server = TestServer::start(vec![TestResponse::ok_without_content_length("0123456789")]);
+        let mut policy = test_policy();
+        policy.max_bytes = 4;
+        let downloader = SafeDownloader::new(policy).expect("client should build");
+        let destination = TestDir::new("stream-size-limit")
+            .path()
+            .join("artifact.bin");
+
+        let error = downloader
+            .fetch_to_path(
+                &request(format!("{}/artifact.bin", server.base_url())),
+                &destination,
+            )
+            .expect_err("streamed size limit should fail");
+
+        let expected_url = format!("{}/artifact.bin", server.base_url());
+        assert_eq!(
+            error.to_string(),
+            format!("download for `{expected_url}` exceeded size limit (10 > 4 bytes)")
+        );
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_download_destinations() {
+        let server = TestServer::start(vec![TestResponse::ok("hello")]);
+        let downloader = SafeDownloader::new(test_policy()).expect("client should build");
+        let temp = TestDir::new("symlink-destination");
+        let real_target = temp.path().join("real-target.bin");
+        let destination = temp.path().join("artifact.bin");
+        fs::write(&real_target, "keep me").expect("real target should be written");
+        symlink(&real_target, &destination).expect("symlink should be created");
+
+        let error = downloader
+            .fetch_to_path(
+                &request(format!("{}/artifact.bin", server.base_url())),
+                &destination,
+            )
+            .expect_err("symlink destination should fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!("refusing to use symlink path {}", destination.display())
+        );
+        assert_eq!(
+            fs::read_to_string(&real_target).expect("real target should remain untouched"),
+            "keep me"
+        );
+    }
+
+    #[test]
     fn rejects_requests_that_timeout() {
         let server = TestServer::start(vec![TestResponse::delayed_ok(
             Duration::from_millis(150),
@@ -1071,6 +1162,47 @@ mod tests {
         assert_eq!(server.paths(), vec!["/requests-2.32.3.tar.gz"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_cache_entries() {
+        let repo_root = TestDir::new("cache-symlink");
+        let state_layout =
+            StateLayout::from_repo_root(repo_root.path()).expect("state layout should build");
+        let cache = ArtifactCache::from_state_layout(&state_layout);
+        let downloader = SafeDownloader::new(test_policy()).expect("client should build");
+        let package_version = package_version(Ecosystem::Npm, "chalk", "5.4.0");
+        let metadata = ArtifactMetadata {
+            filename: "chalk-5.4.0.tgz".to_string(),
+            size_bytes: Some(5),
+        };
+        let cache_path = cache
+            .path_for(&package_version, &metadata)
+            .expect("cache path should build");
+        let real_target = repo_root.path().join("outside.bin");
+        fs::write(&real_target, "hello").expect("real target should be written");
+        fs::create_dir_all(cache_path.parent().expect("cache path should have parent"))
+            .expect("cache directories should be created");
+        symlink(&real_target, &cache_path).expect("cache symlink should be created");
+
+        let request = request_with_artifact_metadata(
+            "http://example.test/chalk-5.4.0.tgz".to_string(),
+            "chalk-5.4.0.tgz",
+            Some(5),
+        );
+        let error = cache
+            .fetch(&downloader, &package_version, &request)
+            .expect_err("symlink cache entry should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            format!("refusing to use symlink path {}", cache_path.display())
+        );
+        assert_eq!(
+            fs::read_to_string(&real_target).expect("real target should remain untouched"),
+            "hello"
+        );
+    }
+
     fn test_policy() -> DownloadPolicy {
         DownloadPolicy {
             https_only: false,
@@ -1116,6 +1248,7 @@ mod tests {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
         delay: Duration,
+        include_content_length: bool,
     }
 
     impl TestResponse {
@@ -1128,7 +1261,14 @@ mod tests {
                 )],
                 body: body.as_bytes().to_vec(),
                 delay: Duration::ZERO,
+                include_content_length: true,
             }
+        }
+
+        fn ok_without_content_length(body: &str) -> Self {
+            let mut response = Self::ok(body);
+            response.include_content_length = false;
+            response
         }
 
         fn delayed_ok(delay: Duration, body: &str) -> Self {
@@ -1143,6 +1283,7 @@ mod tests {
                 headers: vec![("Location".to_string(), location.to_string())],
                 body: Vec::new(),
                 delay: Duration::ZERO,
+                include_content_length: true,
             }
         }
     }
@@ -1183,10 +1324,16 @@ mod tests {
                     }
 
                     let mut headers = response.headers;
-                    headers.push((
-                        "Content-Length".to_string(),
-                        response.body.len().to_string(),
-                    ));
+                    if response.include_content_length
+                        && !headers
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+                    {
+                        headers.push((
+                            "Content-Length".to_string(),
+                            response.body.len().to_string(),
+                        ));
+                    }
                     headers.push(("Connection".to_string(), "close".to_string()));
 
                     let mut response_text = format!("HTTP/1.1 {}\r\n", response.status);

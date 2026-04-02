@@ -676,6 +676,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_link_entries_in_gem_archives() {
+        let temp = TestDir::new("gem-symlink");
+        let artifact = temp.path().join("bad.gem");
+        write_gem_archive(&artifact, vec![ArchiveEntry::symlink("pkg/link", "target")]);
+
+        let error = SafeUnpacker::default()
+            .unpack_gem(&artifact, temp.path().join("out"))
+            .expect_err("gem symlink should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "archive entry `pkg/link` is a symlink or hard link"
+        );
+    }
+
+    #[test]
+    fn enforces_single_file_size_limit_in_gem_archives() {
+        let temp = TestDir::new("gem-single-limit");
+        let artifact = temp.path().join("bad.gem");
+        write_gem_archive(
+            &artifact,
+            vec![ArchiveEntry::file("pkg/huge.bin", &[0_u8; 8])],
+        );
+        let mut plan = UnpackPlan::default();
+        plan.limits.max_single_file_bytes = 4;
+
+        let error = SafeUnpacker::new(plan)
+            .unpack_gem(&artifact, temp.path().join("out"))
+            .expect_err("gem single-file limit should be enforced");
+
+        assert_eq!(
+            error.to_string(),
+            "archive entry `pkg/huge.bin` exceeds single-file limit (8 > 4 bytes)"
+        );
+    }
+
+    #[test]
     fn unpacks_zip_files_and_directories() {
         let temp = TestDir::new("zip");
         let artifact = temp.path().join("package.zip");
