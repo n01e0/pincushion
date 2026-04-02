@@ -51,15 +51,19 @@ pub struct RegistryError {
 }
 
 impl RegistryError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
     pub fn placeholder(ecosystem: Ecosystem, operation: impl Into<String>) -> Self {
         let operation = operation.into();
 
-        Self {
-            message: format!(
-                "{} registry placeholder: {operation} is not implemented yet",
-                ecosystem.as_str()
-            ),
-        }
+        Self::new(format!(
+            "{} registry placeholder: {operation} is not implemented yet",
+            ecosystem.as_str()
+        ))
     }
 }
 
