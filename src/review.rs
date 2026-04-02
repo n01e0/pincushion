@@ -1,3 +1,4 @@
+use crate::diff::SuspiciousExcerpt;
 use crate::signals::Signal;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -32,6 +33,7 @@ pub struct ReviewInput {
     pub new_version: String,
     pub summary: ReviewSummary,
     pub manifest_diff: Option<String>,
+    pub interesting_files: Vec<SuspiciousExcerpt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
