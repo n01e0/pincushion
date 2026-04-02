@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::registry::PackageVersion;
+
 pub type PackageKey = String;
 
 pub const STATE_DIR_NAME: &str = ".pincushion";
@@ -125,6 +127,38 @@ impl StateLayout {
 
         Ok(())
     }
+
+    pub fn initialize_baseline_if_empty(
+        &self,
+        current_versions: &[PackageVersion],
+    ) -> Result<BaselineState, StateError> {
+        let seen_state = self.load_seen_state()?;
+        if seen_state.is_empty() {
+            let baseline = SeenState::from_package_versions(current_versions);
+            self.save_seen_state(&baseline)?;
+            Ok(BaselineState::Initialized(baseline))
+        } else {
+            Ok(BaselineState::Existing(seen_state))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaselineState {
+    Initialized(SeenState),
+    Existing(SeenState),
+}
+
+impl BaselineState {
+    pub fn is_baseline_only(&self) -> bool {
+        matches!(self, Self::Initialized(_))
+    }
+
+    pub fn seen_state(&self) -> &SeenState {
+        match self {
+            Self::Initialized(seen_state) | Self::Existing(seen_state) => seen_state,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -133,6 +167,27 @@ pub struct SeenState {
 }
 
 impl SeenState {
+    pub fn is_empty(&self) -> bool {
+        self.packages.is_empty()
+    }
+
+    pub fn version_for(&self, package_key: &str) -> Option<&str> {
+        self.packages.get(package_key).map(String::as_str)
+    }
+
+    pub fn from_package_versions(package_versions: &[PackageVersion]) -> Self {
+        let mut seen_state = Self::default();
+
+        for package_version in package_versions {
+            seen_state.record(
+                package_version.package_key(),
+                package_version.version.clone(),
+            );
+        }
+
+        seen_state
+    }
+
     pub fn record(&mut self, package_key: PackageKey, version: impl Into<String>) {
         self.packages.insert(package_key, version.into());
     }
@@ -182,7 +237,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{SeenState, StateLayout};
+    use crate::registry::{Ecosystem, PackageVersion};
+
+    use super::{BaselineState, SeenState, StateLayout};
 
     #[test]
     fn creates_state_layout_from_repo_root() {
@@ -256,6 +313,67 @@ mod tests {
             .load_seen_state()
             .expect("saved seen state should reload");
         assert_eq!(reloaded, seen);
+    }
+
+    #[test]
+    fn first_run_is_baseline_only_and_persists_current_versions() {
+        let repo_root = TestDir::new("baseline-first-run");
+        let layout = StateLayout::from_repo_root(repo_root.path()).expect("layout should build");
+        let current_versions = vec![
+            package_version(Ecosystem::Npm, "react", "19.0.0"),
+            package_version(Ecosystem::Crates, "clap", "4.5.31"),
+        ];
+
+        let baseline = layout
+            .initialize_baseline_if_empty(&current_versions)
+            .expect("baseline initialization should succeed");
+
+        assert!(baseline.is_baseline_only());
+        assert_eq!(
+            baseline.seen_state().version_for("npm:react"),
+            Some("19.0.0")
+        );
+        assert_eq!(
+            baseline.seen_state().version_for("crates:clap"),
+            Some("4.5.31")
+        );
+
+        let persisted = layout
+            .load_seen_state()
+            .expect("persisted baseline should reload");
+        assert_eq!(persisted, baseline.seen_state().clone());
+    }
+
+    #[test]
+    fn existing_seen_state_skips_baseline_only_mode() {
+        let repo_root = TestDir::new("baseline-existing");
+        let layout = StateLayout::from_repo_root(repo_root.path()).expect("layout should build");
+
+        let mut existing = SeenState::default();
+        existing.record(String::from("npm:react"), "19.0.0");
+        layout
+            .save_seen_state(&existing)
+            .expect("existing seen state should be saved");
+
+        let result = layout
+            .initialize_baseline_if_empty(&[package_version(Ecosystem::Npm, "react", "19.1.0")])
+            .expect("existing seen state should be reused");
+
+        assert_eq!(result, BaselineState::Existing(existing.clone()));
+        assert!(!result.is_baseline_only());
+
+        let persisted = layout
+            .load_seen_state()
+            .expect("seen state should still be readable");
+        assert_eq!(persisted, existing);
+    }
+
+    fn package_version(ecosystem: Ecosystem, package: &str, version: &str) -> PackageVersion {
+        PackageVersion {
+            ecosystem,
+            package: package.to_string(),
+            version: version.to_string(),
+        }
     }
 
     struct TestDir {
