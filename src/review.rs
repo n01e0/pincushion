@@ -264,12 +264,17 @@ impl ClaudeCodeCommandRunner for ProcessClaudeCodeRunner {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub enum ReviewBackend {
-    #[default]
     None(NoneReviewer),
     Codex(CodexReviewer),
     ClaudeCode(ClaudeCodeReviewer),
+}
+
+impl Default for ReviewBackend {
+    fn default() -> Self {
+        Self::None(NoneReviewer)
+    }
 }
 
 impl ReviewBackend {
@@ -307,12 +312,12 @@ fn build_reviewer_prompt(input: &ReviewInput) -> Result<String, ReviewBackendErr
         concat!(
             "You are reviewing a software package update for supply-chain risk.\n",
             "Return ONLY a JSON object with this exact schema:\n",
-            "{\n",
+            "{{\n",
             "  \"verdict\": \"benign\" | \"suspicious\" | \"needs-review\",\n",
             "  \"confidence\": \"low\" | \"medium\" | \"high\",\n",
             "  \"reasons\": string[],\n",
             "  \"focus_files\": string[]\n",
-            "}\n",
+            "}}\n",
             "Rules:\n",
             "- Output valid JSON only, no markdown, no prose outside JSON.\n",
             "- Keep reasons concise and evidence-based.\n",
@@ -556,8 +561,8 @@ mod tests {
     use crate::signals::Signal;
 
     use super::{
-        extract_json_object, ClaudeCodeCommandRunner, ClaudeCodeReviewer, CodexCommandRunner,
-        CodexReviewer, Confidence, NoneReviewer, ReviewBackend, ReviewBackendError, ReviewInput,
+        extract_json_object, ClaudeCodeCommandRunner, CodexCommandRunner, CodexReviewer,
+        Confidence, NoneReviewer, ReviewBackend, ReviewBackendError, ReviewInput,
         ReviewInputAnalysis, ReviewOutput, ReviewProvider, ReviewSummary, ReviewVerdict, Reviewer,
     };
 
@@ -791,11 +796,13 @@ mod tests {
     }
 
     #[test]
-    fn backend_factory_supports_none_and_codex_providers() {
+    fn backend_factory_supports_none_codex_and_claude_providers() {
         let none_backend = ReviewBackend::from_provider(ReviewProvider::None)
             .expect("none provider should be supported");
         let codex_backend = ReviewBackend::from_provider(ReviewProvider::Codex)
             .expect("codex provider should be supported");
+        let claude_backend = ReviewBackend::from_provider(ReviewProvider::ClaudeCode)
+            .expect("claude provider should be supported");
         let input = ReviewInput::default();
         let none_output = none_backend
             .review(&input)
@@ -803,16 +810,7 @@ mod tests {
 
         assert_eq!(none_output.verdict, ReviewVerdict::NeedsReview);
         assert!(matches!(codex_backend, ReviewBackend::Codex(_)));
-    }
-
-    #[test]
-    fn backend_factory_rejects_unimplemented_providers() {
-        let claude_error = ReviewBackend::from_provider(ReviewProvider::ClaudeCode)
-            .expect_err("claude backend should not be implemented yet");
-        assert_eq!(
-            claude_error.to_string(),
-            "review backend `claude-code` is not implemented yet"
-        );
+        assert!(matches!(claude_backend, ReviewBackend::ClaudeCode(_)));
     }
 
     #[test]
