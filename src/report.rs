@@ -28,6 +28,11 @@ pub struct JsonReport {
 }
 
 #[derive(Debug, Clone)]
+pub struct JsonReportWriter<'a> {
+    state_layout: &'a StateLayout,
+}
+
+#[derive(Debug, Clone)]
 pub struct JsonReportInput<'a> {
     pub status: &'a str,
     pub ecosystem: Ecosystem,
@@ -39,6 +44,38 @@ pub struct JsonReportInput<'a> {
     pub manifest_diff: Option<String>,
     pub interesting_files: &'a [SuspiciousExcerpt],
     pub review: &'a ReviewOutput,
+}
+
+impl<'a> JsonReportWriter<'a> {
+    pub fn new(state_layout: &'a StateLayout) -> Self {
+        Self { state_layout }
+    }
+
+    pub fn path_for(
+        &self,
+        ecosystem: Ecosystem,
+        package: &str,
+        old_version: &str,
+        new_version: &str,
+    ) -> PathBuf {
+        self.state_layout.reports_dir().join(report_relative_path(
+            ecosystem.as_str(),
+            package,
+            old_version,
+            new_version,
+        ))
+    }
+
+    pub fn write_report(&self, report: &JsonReport) -> Result<PathBuf, ReportError> {
+        let path = self.state_layout.reports_dir().join(report.relative_path());
+        report.write_to_path(&path)?;
+        Ok(path)
+    }
+
+    pub fn write_analysis(&self, input: JsonReportInput<'_>) -> Result<PathBuf, ReportError> {
+        let report = JsonReport::from_analysis(input);
+        self.write_report(&report)
+    }
 }
 
 impl JsonReport {
@@ -66,15 +103,16 @@ impl JsonReport {
     }
 
     pub fn relative_path(&self) -> PathBuf {
-        PathBuf::from(&self.ecosystem)
-            .join(sanitize_path_component(&self.package))
-            .join(format!("{}_to_{}.json", self.old_version, self.new_version))
+        report_relative_path(
+            &self.ecosystem,
+            &self.package,
+            &self.old_version,
+            &self.new_version,
+        )
     }
 
     pub fn write_to_reports_dir(&self, state_layout: &StateLayout) -> Result<PathBuf, ReportError> {
-        let path = state_layout.reports_dir().join(self.relative_path());
-        self.write_to_path(&path)?;
-        Ok(path)
+        JsonReportWriter::new(state_layout).write_report(self)
     }
 
     pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), ReportError> {
@@ -176,6 +214,17 @@ pub struct MarkdownReport {
     pub body: String,
 }
 
+fn report_relative_path(
+    ecosystem: &str,
+    package: &str,
+    old_version: &str,
+    new_version: &str,
+) -> PathBuf {
+    PathBuf::from(ecosystem)
+        .join(sanitize_path_component(package))
+        .join(format!("{old_version}_to_{new_version}.json"))
+}
+
 fn review_verdict_label(verdict: &ReviewVerdict) -> &'static str {
     match verdict {
         ReviewVerdict::Benign => "benign",
@@ -229,7 +278,7 @@ mod tests {
     use crate::signals::Signal;
     use crate::state::StateLayout;
 
-    use super::{JsonReport, JsonReportInput};
+    use super::{JsonReport, JsonReportInput, JsonReportWriter};
 
     #[test]
     fn builds_machine_readable_json_report() {
@@ -285,6 +334,23 @@ mod tests {
     }
 
     #[test]
+    fn writer_builds_scoped_package_paths_under_reports_dir() {
+        let repo_root = TestDir::new("reports-paths");
+        let state_layout =
+            StateLayout::from_repo_root(repo_root.path()).expect("state layout should build");
+        let writer = JsonReportWriter::new(&state_layout);
+
+        assert_eq!(
+            writer.path_for(Ecosystem::Npm, "@types/node", "20.0.0", "20.1.0"),
+            state_layout
+                .reports_dir()
+                .join("npm")
+                .join("~40types~2Fnode")
+                .join("20.0.0_to_20.1.0.json")
+        );
+    }
+
+    #[test]
     fn writes_package_json_report_under_state_layout() {
         let repo_root = TestDir::new("reports-layout");
         let state_layout =
@@ -297,21 +363,21 @@ mod tests {
             focus_files: vec!["package.json".to_string()],
             failure_reason: Some("review backend timed out".to_string()),
         };
-        let report = JsonReport::from_analysis(JsonReportInput {
-            status: "ok",
-            ecosystem: Ecosystem::Npm,
-            package: "@types/node",
-            old_version: "20.0.0",
-            new_version: "20.1.0",
-            diff: &diff,
-            signals: &[Signal::EntrypointChanged],
-            manifest_diff: None,
-            interesting_files: &[],
-            review: &review,
-        });
+        let writer = JsonReportWriter::new(&state_layout);
 
-        let path = report
-            .write_to_reports_dir(&state_layout)
+        let path = writer
+            .write_analysis(JsonReportInput {
+                status: "ok",
+                ecosystem: Ecosystem::Npm,
+                package: "@types/node",
+                old_version: "20.0.0",
+                new_version: "20.1.0",
+                diff: &diff,
+                signals: &[Signal::EntrypointChanged],
+                manifest_diff: None,
+                interesting_files: &[],
+                review: &review,
+            })
             .expect("report should be written");
         let json = fs::read_to_string(&path).expect("report file should exist");
         let value: Value = serde_json::from_str(&json).expect("report json should parse");
