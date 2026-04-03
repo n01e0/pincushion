@@ -1,0 +1,11 @@
+npm:
+  - react
+  - chalk
+rubygems:
+  - rails
+pypi:
+  - requests
+crates:
+  - clap
+review:
+  provider: none
