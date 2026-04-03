@@ -4,7 +4,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::{
-    DownloadedArtifact, Ecosystem, PackageVersion, Registry, RegistryError, RegistryResult,
+    blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
+    RegistryError, RegistryResult,
 };
 
 const DEFAULT_METADATA_BASE_URL: &str = "https://registry.npmjs.org";
@@ -70,12 +71,7 @@ impl Registry for NpmRegistry {
     }
 
     fn latest_version(&self, package: &str) -> RegistryResult<PackageVersion> {
-        let response = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|source| {
-                RegistryError::new(format!("failed to build npm registry client: {source}"))
-            })?
+        let response = blocking_metadata_client(Duration::from_secs(15))?
             .get(self.metadata_url(package))
             .send()
             .map_err(|source| {

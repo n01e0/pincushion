@@ -9,6 +9,7 @@ use reqwest::blocking::Client;
 use reqwest::header::LOCATION;
 use reqwest::{StatusCode, Url};
 
+use crate::http;
 use crate::registry::{DownloadedArtifact, PackageVersion};
 use crate::state::StateLayout;
 
@@ -192,11 +193,8 @@ impl ArtifactCache {
 
 impl SafeDownloader {
     pub fn new(policy: DownloadPolicy) -> Result<Self, FetchError> {
-        let client = Client::builder()
-            .timeout(policy.timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(FetchError::ClientBuild)?;
+        let client =
+            http::blocking_client_no_redirect(policy.timeout).map_err(FetchError::ClientBuild)?;
 
         Ok(Self { policy, client })
     }

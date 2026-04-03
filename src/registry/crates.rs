@@ -4,7 +4,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::{
-    DownloadedArtifact, Ecosystem, PackageVersion, Registry, RegistryError, RegistryResult,
+    blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
+    RegistryError, RegistryResult,
 };
 
 const DEFAULT_METADATA_BASE_URL: &str = "https://crates.io/api/v1/crates";
@@ -67,12 +68,7 @@ impl Registry for CratesRegistry {
     }
 
     fn latest_version(&self, package: &str) -> RegistryResult<PackageVersion> {
-        let response = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|source| {
-                RegistryError::new(format!("failed to build crates.io client: {source}"))
-            })?
+        let response = blocking_metadata_client(Duration::from_secs(15))?
             .get(self.metadata_url(package))
             .send()
             .map_err(|source| {
@@ -130,6 +126,8 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    use crate::http;
 
     use super::*;
 
@@ -235,9 +233,30 @@ mod tests {
         assert_eq!(server.request_path(), "/clap");
     }
 
+    #[test]
+    fn sends_user_agent_when_fetching_crates_metadata() {
+        let server = TestServer::start(
+            200,
+            r#"{"crate":{"max_stable_version":"4.5.31","newest_version":"4.5.31"}}"#,
+        );
+        let registry = CratesRegistry::with_metadata_base_url(server.base_url());
+
+        registry
+            .latest_version("clap")
+            .expect("latest version should load");
+
+        let request = server.request_raw();
+        let expected = format!("user-agent: {}", http::user_agent().to_ascii_lowercase());
+        assert!(
+            request.to_ascii_lowercase().contains(&expected),
+            "expected request to contain `{expected}`, got:\n{request}"
+        );
+    }
+
     struct TestServer {
         base_url: String,
         request_path: Arc<Mutex<String>>,
+        request_raw: Arc<Mutex<String>>,
         thread: Option<thread::JoinHandle<()>>,
     }
 
@@ -249,6 +268,8 @@ mod tests {
 
             let request_path = Arc::new(Mutex::new(String::new()));
             let request_path_for_thread = request_path.clone();
+            let request_raw = Arc::new(Mutex::new(String::new()));
+            let request_raw_for_thread = request_raw.clone();
 
             let thread = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("request should arrive");
@@ -256,7 +277,7 @@ mod tests {
                 let read = stream
                     .read(&mut buffer)
                     .expect("request should be readable");
-                let request = String::from_utf8_lossy(&buffer[..read]);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                 let path = request
                     .lines()
                     .next()
@@ -266,6 +287,9 @@ mod tests {
                 *request_path_for_thread
                     .lock()
                     .expect("path lock should succeed") = path;
+                *request_raw_for_thread
+                    .lock()
+                    .expect("raw request lock should succeed") = request.clone();
 
                 let response = format!(
                     "HTTP/1.1 {status_code} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
@@ -280,6 +304,7 @@ mod tests {
             Self {
                 base_url,
                 request_path,
+                request_raw,
                 thread: Some(thread),
             }
         }
@@ -295,6 +320,16 @@ mod tests {
             self.request_path
                 .lock()
                 .expect("path lock should succeed")
+                .clone()
+        }
+
+        fn request_raw(mut self) -> String {
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("server thread should finish");
+            }
+            self.request_raw
+                .lock()
+                .expect("raw request lock should succeed")
                 .clone()
         }
     }

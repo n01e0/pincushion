@@ -5,7 +5,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::{
-    DownloadedArtifact, Ecosystem, PackageVersion, Registry, RegistryError, RegistryResult,
+    blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
+    RegistryError, RegistryResult,
 };
 
 const DEFAULT_METADATA_BASE_URL: &str = "https://pypi.org/pypi";
@@ -33,10 +34,7 @@ impl PypiRegistry {
     }
 
     fn fetch_package_metadata(&self, package: &str) -> RegistryResult<PypiPackageMetadata> {
-        reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|source| RegistryError::new(format!("failed to build pypi client: {source}")))?
+        blocking_metadata_client(Duration::from_secs(15))?
             .get(self.metadata_url(package))
             .send()
             .map_err(|source| {
