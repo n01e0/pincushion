@@ -1,8 +1,12 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use reqwest::blocking::Client;
 
 use crate::config::WatchlistConfig;
+use crate::http;
 
 pub mod crates;
 pub mod npm;
@@ -97,6 +101,11 @@ impl fmt::Display for RegistryError {
 impl Error for RegistryError {}
 
 pub type RegistryResult<T> = Result<T, RegistryError>;
+
+pub(crate) fn blocking_metadata_client(timeout: Duration) -> RegistryResult<Client> {
+    http::blocking_client(timeout)
+        .map_err(|source| RegistryError::new(format!("failed to build registry client: {source}")))
+}
 
 pub trait Registry {
     fn ecosystem(&self) -> Ecosystem;

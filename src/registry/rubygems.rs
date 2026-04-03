@@ -6,7 +6,8 @@ use serde::Deserialize;
 use crate::unpack::SafeUnpacker;
 
 use super::{
-    DownloadedArtifact, Ecosystem, PackageVersion, Registry, RegistryError, RegistryResult,
+    blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
+    RegistryError, RegistryResult,
 };
 
 const DEFAULT_METADATA_BASE_URL: &str = "https://rubygems.org/api/v1/gems";
@@ -67,12 +68,7 @@ impl Registry for RubygemsRegistry {
     }
 
     fn latest_version(&self, package: &str) -> RegistryResult<PackageVersion> {
-        let response = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|source| {
-                RegistryError::new(format!("failed to build rubygems client: {source}"))
-            })?
+        let response = blocking_metadata_client(Duration::from_secs(15))?
             .get(self.metadata_url(package))
             .send()
             .map_err(|source| {

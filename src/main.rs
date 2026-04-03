@@ -3,6 +3,7 @@
 mod config;
 mod diff;
 mod fetch;
+mod http;
 mod inventory;
 mod registry;
 mod report;
