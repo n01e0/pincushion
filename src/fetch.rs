@@ -11,7 +11,7 @@ use reqwest::{StatusCode, Url};
 
 use crate::http;
 use crate::registry::{DownloadedArtifact, PackageVersion};
-use crate::state::StateLayout;
+use crate::state::{version_scoped_state_directory, StateLayout};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadPolicy {
@@ -118,12 +118,7 @@ impl ArtifactCache {
         metadata: &ArtifactMetadata,
     ) -> Result<PathBuf, FetchError> {
         metadata.validate()?;
-        Ok(self
-            .root
-            .join(package_version.ecosystem.as_str())
-            .join(sanitize_cache_path_component(&package_version.package))
-            .join(sanitize_cache_path_component(&package_version.version))
-            .join(&metadata.filename))
+        Ok(version_scoped_state_directory(&self.root, package_version).join(&metadata.filename))
     }
 
     pub fn fetch(
@@ -491,25 +486,6 @@ impl SafeDownloader {
                 source,
             }
         }
-    }
-}
-
-fn sanitize_cache_path_component(component: &str) -> String {
-    let mut sanitized = String::with_capacity(component.len());
-
-    for byte in component.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
-                sanitized.push(byte as char);
-            }
-            _ => sanitized.push_str(&format!("~{byte:02X}")),
-        }
-    }
-
-    if sanitized.is_empty() {
-        "_".to_string()
-    } else {
-        sanitized
     }
 }
 
