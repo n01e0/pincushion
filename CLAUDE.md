@@ -68,6 +68,15 @@ watchlist.yaml と同じディレクトリに `.pincushion/` が作られる:
 - 10: diff パイプラインが `check` に接続された後の suspicious package 用に予約
 - 20: 一部のパッケージ lookup に失敗 (partial failure)
 
+### GitHub merge note for claw-loop task runners
+
+`gh pr merge --auto` の終了コードだけで task を blocked 扱いにしないこと。auto-merge 有効化コマンドが失敗しても、原因が「すでに有効」「PR は存在していて merge 待ち」「直後の状態変化の競合」なら、その場で `gh pr view` を確認して次を返す:
+
+- もう merged 済みなら `TASK_DONE PR_URL=...`
+- PR が存在して merge 待ちなら `TASK_WAITING_MERGE PR_URL=...`
+
+つまり、merge コマンド自体の一時的な失敗ではなく、**最終的な PR 状態**で判定する。`auto-merge enable failed` だけを理由に recoverable task を `TASK_BLOCKED` にしない。
+
 ## Testing patterns
 
 - テストフィクスチャは `tests/fixtures/` に配置。`config/`, `registry/`, `state/`, `e2e/` のサブディレクトリで分類
