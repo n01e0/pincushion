@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod artifact_pipeline;
 mod config;
 mod diff;
 mod fetch;
