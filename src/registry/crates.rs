@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use crate::fetch::{ArtifactCache, ArtifactMetadata, DownloadPolicy, FetchRequest, SafeDownloader};
 use crate::state::version_scoped_state_directory;
+use crate::unpack::SafeUnpacker;
 
 use super::{
     blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
@@ -252,8 +253,17 @@ impl Registry for CratesRegistry {
             })
     }
 
-    fn unpack(&self, _artifact: &Path, _destination: &Path) -> RegistryResult<()> {
-        Err(RegistryError::placeholder(self.ecosystem(), "unpack"))
+    fn unpack(&self, artifact: &Path, destination: &Path) -> RegistryResult<()> {
+        SafeUnpacker::default()
+            .unpack_crate(artifact, destination)
+            .map(|_| ())
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to unpack crates.io artifact {} into {}: {source}",
+                    artifact.display(),
+                    destination.display()
+                ))
+            })
     }
 }
 
@@ -286,12 +296,16 @@ fn artifact_filename_for(package_version: &PackageVersion) -> String {
 mod tests {
     use std::env;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
 
     use crate::http;
     use crate::state::StateLayout;
@@ -450,6 +464,37 @@ mod tests {
                 "GET /files/clap-4.5.31.crate".to_string(),
                 "HEAD /api/v1/crates/clap/4.5.31/download".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn unpacks_crate_artifacts_safely() {
+        let registry = CratesRegistry::new();
+        let fixture = TestDir::new("crates-unpack");
+        let artifact = fixture.path().join("clap-4.5.31.crate");
+        let destination = fixture.path().join("out");
+        write_crate_archive(
+            &artifact,
+            &[
+                ArchiveFile::new("clap-4.5.31/Cargo.toml", b"[package]\nname = \"clap\"\n"),
+                ArchiveFile::new("clap-4.5.31/src/lib.rs", b"pub fn clap() {}\n"),
+            ],
+        )
+        .expect("crate archive should be created");
+
+        registry
+            .unpack(&artifact, &destination)
+            .expect("crate should unpack");
+
+        assert_eq!(
+            fs::read_to_string(destination.join("clap-4.5.31/Cargo.toml"))
+                .expect("cargo manifest should exist"),
+            "[package]\nname = \"clap\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("clap-4.5.31/src/lib.rs"))
+                .expect("crate source should exist"),
+            "pub fn clap() {}\n"
         );
     }
 
@@ -717,6 +762,36 @@ mod tests {
         request_path: Arc<Mutex<String>>,
         request_raw: Arc<Mutex<String>>,
         thread: Option<thread::JoinHandle<()>>,
+    }
+
+    struct ArchiveFile<'a> {
+        path: &'a str,
+        contents: &'a [u8],
+    }
+
+    impl<'a> ArchiveFile<'a> {
+        fn new(path: &'a str, contents: &'a [u8]) -> Self {
+            Self { path, contents }
+        }
+    }
+
+    fn write_crate_archive(path: &Path, files: &[ArchiveFile<'_>]) -> std::io::Result<()> {
+        let file = fs::File::create(path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for file in files {
+            let mut header = Header::new_gnu();
+            header.set_path(file.path)?;
+            header.set_mode(0o644);
+            header.set_size(file.contents.len() as u64);
+            header.set_cksum();
+            builder.append(&header, Cursor::new(file.contents))?;
+        }
+
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+        Ok(())
     }
 
     struct TestDir {
