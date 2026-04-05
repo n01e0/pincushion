@@ -1,6 +1,8 @@
 # pincushion
 
-A local Rust CLI that monitors package registries for version changes, compares artifact contents between versions, detects supply-chain risk signals, and produces JSON/Markdown reports for human review.
+A local Rust CLI for monitoring package registries for version changes.
+
+Today, `pincushion check` resolves latest versions, records baseline/change state, and reports which packages changed. The artifact fetch/unpack/diff/review/report pipeline exists in library modules, but it is not fully wired into `check` yet.
 
 [日本語版 README](README_ja.md)
 
@@ -56,17 +58,28 @@ pincushion check --config watchlist.yaml
 
 On the **first run**, pincushion records the current versions as a baseline and exits. No analysis is performed.
 
-On **subsequent runs**, pincushion compares the latest registry versions against the saved baseline and, for each version change:
+On **subsequent runs today**, pincushion:
 
-1. Downloads the old and new artifacts from the registry
-2. Unpacks them (tar.gz or zip) with path-traversal protection and size limits
-3. Inventories all files with SHA-256 digests
-4. Diffs the two inventories to find added, removed, and modified files
-5. Scans for supply-chain risk signals
-6. Optionally sends the diff context to a review backend (Codex or Claude Code) for automated triage
-7. Writes a JSON report and a Markdown report to `.pincushion/reports/`
+1. Resolves the latest version for each configured package
+2. Compares those versions against the saved baseline
+3. Prints changed / unchanged / newly tracked packages
+4. Updates `.pincushion/seen.json`
+
+The current implementation gap is only considered closed when `pincushion check` itself runs **fetch -> unpack -> diff** for changed packages across **npm, RubyGems, PyPI, and crates.io**. Having those pieces only in standalone modules or tests does not count.
+
+Target full pipeline once that gap is closed:
+
+1. Download the old and new artifacts from the registry
+2. Unpack them (tar.gz or zip) with path-traversal protection and size limits
+3. Inventory all files with SHA-256 digests
+4. Diff the two inventories to find added, removed, and modified files
+5. Scan for supply-chain risk signals
+6. Optionally send the diff context to a review backend (Codex or Claude Code) for automated triage
+7. Write a JSON report and a Markdown report to `.pincushion/reports/`
 
 ### Detected signals
+
+These are the signals the full diff pipeline is meant to surface once the artifact path is wired into `check`.
 
 pincushion looks for the following risk indicators across ecosystem-specific manifests and file contents:
 
@@ -83,7 +96,7 @@ pincushion looks for the following risk indicators across ecosystem-specific man
 
 ### Review backends
 
-The `review.provider` config controls automated review:
+Once the artifact diff path is connected to `check`, the `review.provider` config will control automated review:
 
 | Provider | Description |
 |----------|-------------|
@@ -95,7 +108,7 @@ When a review backend fails, pincushion uses a **fail-closed** policy: the packa
 
 ### Report output
 
-Reports are written to `.pincushion/reports/<ecosystem>/<package>/<old>-<new>.{json,md}`.
+Once the artifact diff path is connected to `check`, reports will be written to `.pincushion/reports/<ecosystem>/<package>/<old>-<new>.{json,md}`.
 
 JSON reports contain structured fields for automation:
 
@@ -118,7 +131,7 @@ Markdown reports are human-readable and include manifest diffs and annotated cod
 
 ### State directory
 
-pincushion creates a `.pincushion/` directory next to the watchlist config:
+pincushion creates a `.pincushion/` directory next to the watchlist config. Today, `seen.json` is the actively used file; the other directories are the intended layout for the artifact pipeline once it is wired into `check`:
 
 ```
 .pincushion/
@@ -132,8 +145,8 @@ pincushion creates a `.pincushion/` directory next to the watchlist config:
 
 | Code | Meaning |
 |------|---------|
-| 0 | All packages resolved, no suspicious findings |
-| 10 | Suspicious packages detected |
+| 0 | Successful run with no partial lookup failures |
+| 10 | Reserved for suspicious packages once the diff pipeline is wired into `check` |
 | 20 | Partial failure (some registry lookups failed) |
 
 ### Download safety

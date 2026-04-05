@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is pincushion
 
-パッケージウォッチリストに基づいてレジストリの最新バージョンを取得し、前回との差分を比較してサプライチェーンリスクのシグナルを検出するローカルRust CLI。バージョン変更があればアーティファクトをダウンロード・展開し、diffとシグナル分析を行い、JSON/Markdownレポートを生成する。
+パッケージウォッチリストに基づいてレジストリの最新バージョンを取得し、前回との差分を比較するローカルRust CLI。
+
+現状の `check` 実行経路は latest version lookup + baseline/change detection + `seen.json` 更新まで。artifact download / unpack / diff / signal / review / report のモジュールはあるが、まだ `check` から end-to-end ではつながっていない。
 
 ## Build & Test Commands
 
@@ -20,11 +22,16 @@ cargo clippy --all-targets -- -D warnings  # lint
 
 ### Pipeline flow
 
-`check --config <watchlist.yaml>` が唯一のサブコマンド。処理フローは:
+`check --config <watchlist.yaml>` が唯一のサブコマンド。
+
+**現状の `check` 実行経路** は次の 1-3:
 
 1. **config** (`config.rs`) — YAML watchlist をパース。`npm`, `rubygems`, `pypi`, `crates` のパッケージリストと `review.provider` (none/codex/claude-code) を持つ
 2. **registry** (`registry/`) — 各エコシステムのレジストリAPIから最新バージョンを取得。`Registry` trait で `latest_version`, `download_artifact`, `unpack` を定義。具象実装は `npm.rs`, `rubygems.rs`, `pypi.rs`, `crates.rs`
 3. **state** (`state.rs`) — `StateLayout` が `.pincushion/` 配下の状態ディレクトリを管理。`seen.json` で前回のバージョンを記録し、`ChangeDetection` で変更/未変更/新規追跡を判定。初回実行はbaseline-onlyモード
+
+**未接続だが存在する target pipeline 部品** は 4-10:
+
 4. **fetch** (`fetch.rs`) — `DownloadPolicy` (HTTPS強制、ホスト制限、リダイレクト上限) に従ってアーティファクトをダウンロード
 5. **unpack** (`unpack.rs`) — tar.gz/zip を `UnpackLimits` (ファイル数・サイズ上限) に従って展開。パストラバーサル防止あり
 6. **inventory** (`inventory.rs`) — 展開済みファイルのエントリリスト (パス、サイズ、SHA256ダイジェスト) を生成
@@ -32,6 +39,8 @@ cargo clippy --all-targets -- -D warnings  # lint
 8. **signals** (`signals.rs`) — エコシステム固有のリスクシグナル検出 (install script追加、依存変更、バイナリ追加、難読化JS、エンコード済みblob等)
 9. **review** (`review.rs`) — `ReviewBackend` が codex/claude-code CLI を子プロセスとして呼び出し、JSON形式の verdict を取得。失敗時は fail-closed (suspicious扱い)
 10. **report** (`report.rs`) — JSON と Markdown の2形式でレポートを `.pincushion/reports/` に書き出す
+
+実装ギャップの完了条件は、`check` 自体から 4 ecosystem 全部で fetch -> unpack -> diff が通ること。個別モジュールやfixture test だけでは完了扱いにしない。
 
 ### Key abstractions
 
@@ -50,8 +59,8 @@ watchlist.yaml と同じディレクトリに `.pincushion/` が作られる:
 
 ### Exit codes
 
-- 0: 正常終了
-- 10: suspicious なパッケージを検出
+- 0: partial lookup failure のない正常終了
+- 10: diff パイプラインが `check` に接続された後の suspicious package 用に予約
 - 20: 一部のパッケージ lookup に失敗 (partial failure)
 
 ## Testing patterns
