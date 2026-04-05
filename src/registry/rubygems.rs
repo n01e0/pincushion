@@ -5,7 +5,8 @@ use reqwest::header::CONTENT_LENGTH;
 use reqwest::Url;
 use serde::Deserialize;
 
-use crate::fetch::ArtifactMetadata;
+use crate::fetch::{ArtifactCache, ArtifactMetadata, DownloadPolicy, FetchRequest, SafeDownloader};
+use crate::state::version_scoped_state_directory;
 use crate::unpack::SafeUnpacker;
 
 use super::{
@@ -192,6 +193,56 @@ impl RubygemsRegistry {
         Ok(content_length)
     }
 
+    fn download_policy_for(&self, gem_url: &str) -> RegistryResult<DownloadPolicy> {
+        let parsed = Url::parse(gem_url).map_err(|source| {
+            RegistryError::new(format!(
+                "rubygems artifact url `{gem_url}` is invalid: {source}"
+            ))
+        })?;
+
+        let mut policy = DownloadPolicy {
+            https_only: parsed.scheme() != "http",
+            ..DownloadPolicy::default()
+        };
+
+        if let Some(host) = parsed.host_str() {
+            policy.allowed_hosts = vec![host.to_string()];
+        }
+
+        Ok(policy)
+    }
+
+    fn cache_from_destination(
+        &self,
+        package_version: &PackageVersion,
+        destination: &Path,
+    ) -> RegistryResult<ArtifactCache> {
+        let Some(cache_root) = destination.ancestors().nth(3) else {
+            return Err(RegistryError::new(format!(
+                "rubygems artifact destination `{}` is not under a version-scoped cache directory",
+                destination.display()
+            )));
+        };
+
+        let expected_destination = version_scoped_state_directory(cache_root, package_version);
+        if expected_destination != destination {
+            return Err(RegistryError::new(format!(
+                "rubygems artifact destination `{}` does not match the version-scoped cache path `{}`",
+                destination.display(),
+                expected_destination.display()
+            )));
+        }
+
+        Ok(ArtifactCache::new(cache_root))
+    }
+
+    fn fetch_request_for(&self, artifact: &RubygemsArtifact) -> FetchRequest {
+        FetchRequest {
+            url: artifact.url.clone(),
+            artifact_metadata: Some(artifact.metadata.clone()),
+        }
+    }
+
     fn parse_latest_version(
         &self,
         package: &str,
@@ -232,13 +283,29 @@ impl Registry for RubygemsRegistry {
 
     fn download_artifact(
         &self,
-        _package: &PackageVersion,
-        _destination: &Path,
+        package: &PackageVersion,
+        destination: &Path,
     ) -> RegistryResult<DownloadedArtifact> {
-        Err(RegistryError::placeholder(
-            self.ecosystem(),
-            "download_artifact",
-        ))
+        let artifact = self.resolve_artifact(package)?;
+        let cache = self.cache_from_destination(package, destination)?;
+        let downloader =
+            SafeDownloader::new(self.download_policy_for(&artifact.url)?).map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to build rubygems downloader for `{}` version `{}`: {source}",
+                    package.package, package.version
+                ))
+            })?;
+        let request = self.fetch_request_for(&artifact);
+
+        cache
+            .fetch(&downloader, package, &request)
+            .map(|cached| cached.artifact)
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to download rubygems artifact for `{}` version `{}`: {source}",
+                    package.package, package.version
+                ))
+            })
     }
 
     fn unpack(&self, artifact: &Path, destination: &Path) -> RegistryResult<()> {
@@ -292,10 +359,16 @@ fn artifact_filename_from_url(url: &str) -> RegistryResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::state::StateLayout;
 
     use super::*;
 
@@ -391,6 +464,69 @@ mod tests {
                 "HEAD /gems/rails-8.0.0.gem".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn downloads_artifact_through_safe_downloader_and_cache() {
+        let server = RequestSequenceServer::start_with_builder(|base_url| {
+            vec![
+                ResponseSpec::json(
+                    200,
+                    "/api/v2/rubygems/rails/versions/8.0.0.json",
+                    format!("{{\"gem_uri\":\"{base_url}/gems/rails-8.0.0.gem\",\"size\":13}}"),
+                ),
+                ResponseSpec::get(200, "/gems/rails-8.0.0.gem", "fake gem body"),
+                ResponseSpec::json(
+                    200,
+                    "/api/v2/rubygems/rails/versions/8.0.0.json",
+                    format!("{{\"gem_uri\":\"{base_url}/gems/rails-8.0.0.gem\",\"size\":13}}"),
+                ),
+            ]
+        });
+        let registry = RubygemsRegistry::with_base_urls(server.v1_base_url(), server.v2_base_url());
+        let package = package_version("rails", "8.0.0");
+        let fixture = TestDir::new("rubygems-download-cache");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let destination = state_layout.artifact_cache_dir_for(&package);
+
+        let first = registry
+            .download_artifact(&package, &destination)
+            .expect("first artifact download should succeed");
+        let second = registry
+            .download_artifact(&package, &destination)
+            .expect("second artifact download should hit cache");
+
+        assert_eq!(first.path, destination.join("rails-8.0.0.gem"));
+        assert_eq!(second.path, first.path);
+        assert_eq!(
+            fs::read_to_string(&first.path).expect("artifact should be readable"),
+            "fake gem body"
+        );
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /api/v2/rubygems/rails/versions/8.0.0.json".to_string(),
+                "GET /gems/rails-8.0.0.gem".to_string(),
+                "GET /api/v2/rubygems/rails/versions/8.0.0.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_download_destination_outside_version_scoped_cache() {
+        let registry = RubygemsRegistry::new();
+        let package = package_version("rails", "8.0.0");
+        let fixture = TestDir::new("rubygems-download-destination");
+        let invalid_destination = fixture.path().join("artifacts").join("rails");
+
+        let error = registry
+            .cache_from_destination(&package, &invalid_destination)
+            .expect_err("invalid cache destination should fail");
+
+        assert!(error
+            .to_string()
+            .contains("does not match the version-scoped cache path"));
     }
 
     #[test]
@@ -491,6 +627,17 @@ mod tests {
                 method: "GET".to_string(),
                 path: path.to_string(),
                 content_type: "application/json",
+                body: body.into(),
+                content_length: None,
+            }
+        }
+
+        fn get(status_code: u16, path: &str, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "application/octet-stream",
                 body: body.into(),
                 content_length: None,
             }
@@ -667,6 +814,32 @@ mod tests {
                 .lock()
                 .expect("path lock should succeed")
                 .clone()
+        }
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos();
+            let path = env::temp_dir().join(format!("pincushion-rubygems-{label}-{unique}"));
+            fs::create_dir_all(&path).expect("test dir should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
         }
     }
 }
