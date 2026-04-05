@@ -89,6 +89,23 @@ impl StateLayout {
         &self.reports_dir
     }
 
+    pub fn artifact_cache_dir_for(&self, package_version: &PackageVersion) -> PathBuf {
+        version_scoped_state_directory(&self.artifacts_dir, package_version)
+    }
+
+    pub fn unpacked_version_dir_for(&self, package_version: &PackageVersion) -> PathBuf {
+        version_scoped_state_directory(&self.unpacked_dir, package_version)
+    }
+
+    pub fn reset_unpacked_version_dir(
+        &self,
+        package_version: &PackageVersion,
+    ) -> io::Result<PathBuf> {
+        let path = self.unpacked_version_dir_for(package_version);
+        reset_state_directory(&path)?;
+        Ok(path)
+    }
+
     pub fn ensure_dirs(&self) -> io::Result<()> {
         fs::create_dir_all(&self.artifacts_dir)?;
         fs::create_dir_all(&self.unpacked_dir)?;
@@ -292,6 +309,44 @@ impl Error for StateError {
     }
 }
 
+pub(crate) fn version_scoped_state_directory(
+    root: &Path,
+    package_version: &PackageVersion,
+) -> PathBuf {
+    root.join(package_version.ecosystem.as_str())
+        .join(sanitize_state_path_component(&package_version.package))
+        .join(sanitize_state_path_component(&package_version.version))
+}
+
+pub(crate) fn sanitize_state_path_component(component: &str) -> String {
+    let mut sanitized = String::with_capacity(component.len());
+
+    for byte in component.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                sanitized.push(byte as char)
+            }
+            _ => sanitized.push_str(&format!("~{byte:02X}")),
+        }
+    }
+
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
+pub(crate) fn reset_state_directory(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(source),
+    }
+
+    fs::create_dir_all(path)
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -338,6 +393,48 @@ mod tests {
         assert!(layout.unpacked_dir().is_dir());
         assert!(layout.reports_dir().is_dir());
         assert!(!layout.seen_file().exists());
+    }
+
+    #[test]
+    fn builds_safe_artifact_and_unpacked_paths_for_package_versions() {
+        let repo_root = TestDir::new("safe-paths");
+        let layout = StateLayout::from_repo_root(repo_root.path()).expect("layout should build");
+        let package_version = package_version(Ecosystem::Npm, "@scope/demo", "1.0.0+build/5");
+
+        assert_eq!(
+            layout.artifact_cache_dir_for(&package_version),
+            layout
+                .artifacts_dir()
+                .join("npm")
+                .join("~40scope~2Fdemo")
+                .join("1.0.0~2Bbuild~2F5")
+        );
+        assert_eq!(
+            layout.unpacked_version_dir_for(&package_version),
+            layout
+                .unpacked_dir()
+                .join("npm")
+                .join("~40scope~2Fdemo")
+                .join("1.0.0~2Bbuild~2F5")
+        );
+    }
+
+    #[test]
+    fn reset_unpacked_version_dir_removes_stale_contents_before_reuse() {
+        let repo_root = TestDir::new("reset-unpacked");
+        let layout = StateLayout::from_repo_root(repo_root.path()).expect("layout should build");
+        let package_version = package_version(Ecosystem::Crates, "demo", "0.1.0");
+        let unpacked_dir = layout.unpacked_version_dir_for(&package_version);
+        fs::create_dir_all(&unpacked_dir).expect("stale unpack dir should be created");
+        fs::write(unpacked_dir.join("stale.txt"), "old").expect("stale file should be written");
+
+        let reset_path = layout
+            .reset_unpacked_version_dir(&package_version)
+            .expect("unpacked dir should reset cleanly");
+
+        assert_eq!(reset_path, unpacked_dir);
+        assert!(reset_path.is_dir());
+        assert!(!reset_path.join("stale.txt").exists());
     }
 
     #[test]

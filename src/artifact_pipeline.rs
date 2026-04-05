@@ -9,7 +9,9 @@ use crate::inventory::{InventoryError, InventorySummary};
 use crate::registry::{
     DownloadedArtifact, PackageVersion, Registry, RegistryError, RegistryPipeline,
 };
-use crate::state::VersionChange;
+use crate::state::{
+    reset_state_directory, version_scoped_state_directory, StateLayout, VersionChange,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactWorkspace {
@@ -25,12 +27,28 @@ impl ArtifactWorkspace {
         }
     }
 
+    pub fn from_state_layout(state_layout: &StateLayout) -> Self {
+        Self::new(state_layout.artifacts_dir(), state_layout.unpacked_dir())
+    }
+
     pub fn artifact_destination_for(&self, package_version: &PackageVersion) -> PathBuf {
-        version_scoped_directory(&self.artifacts_root, package_version)
+        version_scoped_state_directory(&self.artifacts_root, package_version)
     }
 
     pub fn unpack_destination_for(&self, package_version: &PackageVersion) -> PathBuf {
-        version_scoped_directory(&self.unpacked_root, package_version)
+        version_scoped_state_directory(&self.unpacked_root, package_version)
+    }
+
+    pub fn reset_unpack_destination_for(
+        &self,
+        package_version: &PackageVersion,
+    ) -> Result<PathBuf, ArtifactPipelineError> {
+        let destination = self.unpack_destination_for(package_version);
+        reset_state_directory(&destination).map_err(|source| ArtifactPipelineError::Io {
+            path: destination.clone(),
+            source,
+        })?;
+        Ok(destination)
     }
 }
 
@@ -69,6 +87,15 @@ impl<'a> RegistryPipeline<'a> {
             })
             .collect()
     }
+
+    pub fn process_version_changes_in_state_layout(
+        &self,
+        changes: &[VersionChange],
+        state_layout: &StateLayout,
+    ) -> Vec<ProcessedChangeResult> {
+        let workspace = ArtifactWorkspace::from_state_layout(state_layout);
+        self.process_version_changes(changes, &workspace)
+    }
 }
 
 pub fn process_version_change(
@@ -82,8 +109,7 @@ pub fn process_version_change(
     let previous_artifact = download_package_artifact(registry, &previous_package, workspace)?;
     let current_artifact = download_package_artifact(registry, &current_package, workspace)?;
 
-    let previous_root = workspace.unpack_destination_for(&previous_package);
-    reset_directory(&previous_root)?;
+    let previous_root = workspace.reset_unpack_destination_for(&previous_package)?;
     registry
         .unpack(&previous_artifact.path, &previous_root)
         .map_err(|source| ArtifactPipelineError::Unpack {
@@ -92,8 +118,7 @@ pub fn process_version_change(
             source: Box::new(source),
         })?;
 
-    let current_root = workspace.unpack_destination_for(&current_package);
-    reset_directory(&current_root)?;
+    let current_root = workspace.reset_unpack_destination_for(&current_package)?;
     registry
         .unpack(&current_artifact.path, &current_root)
         .map_err(|source| ArtifactPipelineError::Unpack {
@@ -232,49 +257,6 @@ fn previous_package_version(change: &VersionChange) -> PackageVersion {
     }
 }
 
-fn version_scoped_directory(root: &Path, package_version: &PackageVersion) -> PathBuf {
-    root.join(package_version.ecosystem.as_str())
-        .join(sanitize_path_component(&package_version.package))
-        .join(sanitize_path_component(&package_version.version))
-}
-
-fn sanitize_path_component(component: &str) -> String {
-    let mut sanitized = String::with_capacity(component.len());
-
-    for byte in component.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
-                sanitized.push(byte as char)
-            }
-            _ => sanitized.push_str(&format!("~{byte:02X}")),
-        }
-    }
-
-    if sanitized.is_empty() {
-        "_".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn reset_directory(path: &Path) -> Result<(), ArtifactPipelineError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(ArtifactPipelineError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-    }
-
-    fs::create_dir_all(path).map_err(|source| ArtifactPipelineError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -289,7 +271,7 @@ mod tests {
     use tar::{Builder, EntryType, Header};
 
     use crate::registry::{Ecosystem, PackageVersion, Registry, RegistryError, RegistryPipeline};
-    use crate::state::VersionChange;
+    use crate::state::{StateLayout, VersionChange};
     use crate::unpack::SafeUnpacker;
 
     use super::ArtifactWorkspace;
@@ -297,8 +279,9 @@ mod tests {
     #[test]
     fn processes_changed_packages_through_shared_download_unpack_inventory_diff_pipeline() {
         let temp = TestDir::new("shared-pipeline");
-        let workspace =
-            ArtifactWorkspace::new(temp.path().join("artifacts"), temp.path().join("unpacked"));
+        let state_layout =
+            StateLayout::from_repo_root(temp.path()).expect("state layout should build");
+        let workspace = ArtifactWorkspace::from_state_layout(&state_layout);
 
         let npm = FakeArchiveRegistry::new(Ecosystem::Npm)
             .with_package(
@@ -358,12 +341,23 @@ mod tests {
         let pypi = FakeArchiveRegistry::new(Ecosystem::Pypi);
         let pipeline = RegistryPipeline::new(&npm, &rubygems, &pypi, &crates);
 
-        let results = pipeline.process_version_changes(
+        let stale_path = state_layout
+            .unpacked_version_dir_for(&package_version(Ecosystem::Npm, "demo-npm", "1.1.0"))
+            .join("stale.txt");
+        fs::create_dir_all(
+            stale_path
+                .parent()
+                .expect("stale path should have a parent directory"),
+        )
+        .expect("stale unpack parent should be created");
+        fs::write(&stale_path, b"stale").expect("stale unpack file should be written");
+
+        let results = pipeline.process_version_changes_in_state_layout(
             &[
                 version_change(Ecosystem::Npm, "demo-npm", "1.0.0", "1.1.0"),
                 version_change(Ecosystem::Crates, "demo-crate", "0.1.0", "0.2.0"),
             ],
-            &workspace,
+            &state_layout,
         );
 
         assert_eq!(results.len(), 2);
@@ -388,6 +382,19 @@ mod tests {
         );
         assert!(npm_result.previous_root.exists());
         assert!(npm_result.current_root.exists());
+        assert_eq!(
+            npm_result.previous_artifact.path.parent(),
+            Some(
+                workspace
+                    .artifact_destination_for(&npm_result.previous_package)
+                    .as_path()
+            )
+        );
+        assert_eq!(
+            npm_result.current_root,
+            state_layout.unpacked_version_dir_for(&npm_result.current_package)
+        );
+        assert!(!stale_path.exists());
         assert!(npm_result
             .current_inventory
             .entries
@@ -579,6 +586,14 @@ mod tests {
         }
     }
 
+    fn package_version(ecosystem: Ecosystem, package: &str, version: &str) -> PackageVersion {
+        PackageVersion {
+            ecosystem,
+            package: package.to_string(),
+            version: version.to_string(),
+        }
+    }
+
     fn version_change(
         ecosystem: Ecosystem,
         package: &str,
@@ -586,11 +601,7 @@ mod tests {
         current_version: &str,
     ) -> VersionChange {
         VersionChange {
-            package: PackageVersion {
-                ecosystem,
-                package: package.to_string(),
-                version: current_version.to_string(),
-            },
+            package: package_version(ecosystem, package, current_version),
             previous_version: previous_version.to_string(),
         }
     }
