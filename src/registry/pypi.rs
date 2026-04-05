@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
+use reqwest::Url;
 use serde::Deserialize;
+
+use crate::fetch::{ArtifactCache, ArtifactMetadata, DownloadPolicy, FetchRequest, SafeDownloader};
+use crate::state::version_scoped_state_directory;
 
 use super::{
     blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
@@ -110,6 +114,59 @@ impl PypiRegistry {
             ))
         })
     }
+
+    fn download_policy_for(&self, artifact_url: &str) -> RegistryResult<DownloadPolicy> {
+        let parsed = Url::parse(artifact_url).map_err(|source| {
+            RegistryError::new(format!(
+                "pypi artifact url `{artifact_url}` is invalid: {source}"
+            ))
+        })?;
+
+        let mut policy = DownloadPolicy {
+            https_only: parsed.scheme() != "http",
+            ..DownloadPolicy::default()
+        };
+
+        if let Some(host) = parsed.host_str() {
+            policy.allowed_hosts = vec![host.to_string()];
+        }
+
+        Ok(policy)
+    }
+
+    fn cache_from_destination(
+        &self,
+        package_version: &PackageVersion,
+        destination: &Path,
+    ) -> RegistryResult<ArtifactCache> {
+        let Some(cache_root) = destination.ancestors().nth(3) else {
+            return Err(RegistryError::new(format!(
+                "pypi artifact destination `{}` is not under a version-scoped cache directory",
+                destination.display()
+            )));
+        };
+
+        let expected_destination = version_scoped_state_directory(cache_root, package_version);
+        if expected_destination != destination {
+            return Err(RegistryError::new(format!(
+                "pypi artifact destination `{}` does not match the version-scoped cache path `{}`",
+                destination.display(),
+                expected_destination.display()
+            )));
+        }
+
+        Ok(ArtifactCache::new(cache_root))
+    }
+
+    fn fetch_request_for(&self, artifact: &PypiArtifact) -> FetchRequest {
+        FetchRequest {
+            url: artifact.url.clone(),
+            artifact_metadata: Some(ArtifactMetadata {
+                filename: artifact.filename.clone(),
+                size_bytes: artifact.size_bytes,
+            }),
+        }
+    }
 }
 
 impl Default for PypiRegistry {
@@ -130,13 +187,30 @@ impl Registry for PypiRegistry {
 
     fn download_artifact(
         &self,
-        _package: &PackageVersion,
-        _destination: &Path,
+        package: &PackageVersion,
+        destination: &Path,
     ) -> RegistryResult<DownloadedArtifact> {
-        Err(RegistryError::placeholder(
-            self.ecosystem(),
-            "download_artifact",
-        ))
+        let metadata = self.fetch_package_metadata(&package.package)?;
+        let artifact = self.select_preferred_artifact(package, &metadata)?;
+        let cache = self.cache_from_destination(package, destination)?;
+        let downloader =
+            SafeDownloader::new(self.download_policy_for(&artifact.url)?).map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to build pypi downloader for `{}` version `{}`: {source}",
+                    package.package, package.version
+                ))
+            })?;
+        let request = self.fetch_request_for(&artifact);
+
+        cache
+            .fetch(&downloader, package, &request)
+            .map(|cached| cached.artifact)
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to download pypi artifact for `{}` version `{}`: {source}",
+                    package.package, package.version
+                ))
+            })
     }
 
     fn unpack(&self, _artifact: &Path, _destination: &Path) -> RegistryResult<()> {
@@ -163,6 +237,8 @@ struct PypiDistributionFile {
     filename: Option<String>,
     packagetype: Option<String>,
     url: Option<String>,
+    #[serde(default, alias = "size")]
+    size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -184,6 +260,7 @@ impl PypiArtifactType {
 struct PypiArtifact {
     filename: String,
     url: String,
+    size_bytes: Option<u64>,
     artifact_type: PypiArtifactType,
 }
 
@@ -204,6 +281,7 @@ impl PypiArtifact {
         Some(Self {
             filename: filename.to_string(),
             url: url.to_string(),
+            size_bytes: file.size_bytes,
             artifact_type,
         })
     }
@@ -211,10 +289,16 @@ impl PypiArtifact {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::state::StateLayout;
 
     use super::*;
 
@@ -310,6 +394,7 @@ mod tests {
 
         assert_eq!(artifact.artifact_type, PypiArtifactType::SourceDist);
         assert_eq!(artifact.filename, "requests-2.32.3.tar.gz");
+        assert_eq!(artifact.size_bytes, None);
     }
 
     #[test]
@@ -347,6 +432,7 @@ mod tests {
                 filename: Some("requests-2.32.3.exe".to_string()),
                 packagetype: Some("bdist_egg".to_string()),
                 url: Some("https://files.example/requests.exe".to_string()),
+                size_bytes: None,
             }],
             releases: HashMap::new(),
         };
@@ -359,6 +445,107 @@ mod tests {
             error.to_string(),
             "pypi release `pypi==requests` has no supported sdist or wheel artifact"
         );
+    }
+
+    #[test]
+    fn downloads_sdist_artifact_when_available() {
+        let server = RequestSequenceServer::start_with_builder(|base_url| {
+            vec![
+                ResponseSpec::json(
+                    200,
+                    "/requests/json",
+                    format!(
+                        "{{\"info\":{{\"version\":\"2.32.3\"}},\"urls\":[],\"releases\":{{\"2.32.3\":[{{\"filename\":\"requests-2.32.3-py3-none-any.whl\",\"packagetype\":\"bdist_wheel\",\"url\":\"{base_url}/files/requests-2.32.3-py3-none-any.whl\",\"size\":11}},{{\"filename\":\"requests-2.32.3.tar.gz\",\"packagetype\":\"sdist\",\"url\":\"{base_url}/files/requests-2.32.3.tar.gz\",\"size\":13}}]}}}}"
+                    ),
+                ),
+                ResponseSpec::get(200, "/files/requests-2.32.3.tar.gz", "sdist package"),
+            ]
+        });
+        let registry = PypiRegistry::with_metadata_base_url(server.base_url());
+        let package = package_version("requests", "2.32.3");
+        let fixture = TestDir::new("pypi-download-sdist");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let destination = state_layout.artifact_cache_dir_for(&package);
+
+        let downloaded = registry
+            .download_artifact(&package, &destination)
+            .expect("sdist download should succeed");
+
+        assert_eq!(downloaded.path, destination.join("requests-2.32.3.tar.gz"));
+        assert_eq!(
+            fs::read_to_string(&downloaded.path).expect("artifact should be readable"),
+            "sdist package"
+        );
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /requests/json".to_string(),
+                "GET /files/requests-2.32.3.tar.gz".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn downloads_wheel_when_no_sdist_exists() {
+        let server = RequestSequenceServer::start_with_builder(|base_url| {
+            vec![
+                ResponseSpec::json(
+                    200,
+                    "/requests/json",
+                    format!(
+                        "{{\"info\":{{\"version\":\"2.32.3\"}},\"urls\":[{{\"filename\":\"requests-2.32.3-py3-none-any.whl\",\"packagetype\":\"bdist_wheel\",\"url\":\"{base_url}/files/requests-2.32.3-py3-none-any.whl\",\"size\":11}}],\"releases\":{{}}}}"
+                    ),
+                ),
+                ResponseSpec::get(
+                    200,
+                    "/files/requests-2.32.3-py3-none-any.whl",
+                    "wheel bytes",
+                ),
+            ]
+        });
+        let registry = PypiRegistry::with_metadata_base_url(server.base_url());
+        let package = package_version("requests", "2.32.3");
+        let fixture = TestDir::new("pypi-download-wheel");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let destination = state_layout.artifact_cache_dir_for(&package);
+
+        let downloaded = registry
+            .download_artifact(&package, &destination)
+            .expect("wheel download should succeed");
+
+        assert_eq!(
+            downloaded.path,
+            destination.join("requests-2.32.3-py3-none-any.whl")
+        );
+        assert_eq!(
+            fs::read_to_string(&downloaded.path).expect("artifact should be readable"),
+            "wheel bytes"
+        );
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /requests/json".to_string(),
+                "GET /files/requests-2.32.3-py3-none-any.whl".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_download_destination_outside_version_scoped_cache() {
+        let registry = PypiRegistry::new();
+        let package = package_version("requests", "2.32.3");
+        let fixture = TestDir::new("pypi-download-destination");
+        let invalid_destination = fixture.path().join("artifacts").join("requests");
+
+        let error = registry
+            .cache_from_destination(&package, &invalid_destination)
+            .expect_err("invalid cache destination should fail");
+
+        assert!(error
+            .to_string()
+            .contains("does not match the version-scoped cache path"));
     }
 
     #[test]
@@ -410,6 +597,7 @@ mod tests {
             filename: Some(filename.to_string()),
             packagetype: Some("sdist".to_string()),
             url: Some(url.to_string()),
+            size_bytes: None,
         }
     }
 
@@ -418,6 +606,114 @@ mod tests {
             filename: Some(filename.to_string()),
             packagetype: Some("bdist_wheel".to_string()),
             url: Some(url.to_string()),
+            size_bytes: None,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ResponseSpec {
+        status_code: u16,
+        method: String,
+        path: String,
+        content_type: &'static str,
+        body: Vec<u8>,
+    }
+
+    impl ResponseSpec {
+        fn json(status_code: u16, path: &str, body: impl AsRef<[u8]>) -> Self {
+            Self {
+                status_code,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "application/json",
+                body: body.as_ref().to_vec(),
+            }
+        }
+
+        fn get(status_code: u16, path: &str, body: impl AsRef<[u8]>) -> Self {
+            Self {
+                status_code,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "application/octet-stream",
+                body: body.as_ref().to_vec(),
+            }
+        }
+    }
+
+    struct RequestSequenceServer {
+        base_url: String,
+        request_log: Arc<Mutex<Vec<String>>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl RequestSequenceServer {
+        fn start_with_builder(
+            build_responses: impl FnOnce(&str) -> Vec<ResponseSpec> + Send + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let address = listener.local_addr().expect("local addr should resolve");
+            let base_url = format!("http://{}", address);
+            let responses = build_responses(&base_url);
+            Self::spawn(listener, base_url, responses)
+        }
+
+        fn spawn(listener: TcpListener, base_url: String, responses: Vec<ResponseSpec>) -> Self {
+            let request_log = Arc::new(Mutex::new(Vec::new()));
+            let request_log_for_thread = request_log.clone();
+
+            let thread = thread::spawn(move || {
+                for response_spec in responses {
+                    let (mut stream, _) = listener.accept().expect("request should arrive");
+                    let mut buffer = [0_u8; 4096];
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("request should be readable");
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let mut request_line_parts =
+                        request.lines().next().unwrap_or("").split_whitespace();
+                    let method = request_line_parts.next().unwrap_or("");
+                    let path = request_line_parts.next().unwrap_or("");
+                    request_log_for_thread
+                        .lock()
+                        .expect("request log lock should succeed")
+                        .push(format!("{method} {path}"));
+                    assert_eq!(method, response_spec.method, "unexpected request method");
+                    assert_eq!(path, response_spec.path, "unexpected request path");
+
+                    let mut response = format!(
+                        "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
+                        response_spec.status_code,
+                        response_spec.body.len(),
+                        response_spec.content_type,
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(&response_spec.body);
+                    stream
+                        .write_all(&response)
+                        .expect("response should be written");
+                }
+            });
+
+            Self {
+                base_url,
+                request_log,
+                thread: Some(thread),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn request_log(mut self) -> Vec<String> {
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("server thread should finish");
+            }
+            self.request_log
+                .lock()
+                .expect("request log lock should succeed")
+                .clone()
         }
     }
 
@@ -494,6 +790,32 @@ mod tests {
                 .last()
                 .cloned()
                 .unwrap_or_default()
+        }
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos();
+            let path = env::temp_dir().join(format!("pincushion-pypi-{label}-{unique}"));
+            fs::create_dir_all(&path).expect("test dir should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
         }
     }
 }
