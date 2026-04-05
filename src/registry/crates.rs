@@ -2,9 +2,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use reqwest::header::CONTENT_LENGTH;
+use reqwest::Url;
 use serde::Deserialize;
 
-use crate::fetch::ArtifactMetadata;
+use crate::fetch::{ArtifactCache, ArtifactMetadata, DownloadPolicy, FetchRequest, SafeDownloader};
+use crate::state::version_scoped_state_directory;
 
 use super::{
     blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
@@ -133,6 +135,56 @@ impl CratesRegistry {
         Ok(content_length)
     }
 
+    fn download_policy_for(&self, download_url: &str) -> RegistryResult<DownloadPolicy> {
+        let parsed = Url::parse(download_url).map_err(|source| {
+            RegistryError::new(format!(
+                "crates.io artifact url `{download_url}` is invalid: {source}"
+            ))
+        })?;
+
+        let mut policy = DownloadPolicy {
+            https_only: parsed.scheme() != "http",
+            ..DownloadPolicy::default()
+        };
+
+        if let Some(host) = parsed.host_str() {
+            policy.allowed_hosts = vec![host.to_string()];
+        }
+
+        Ok(policy)
+    }
+
+    fn cache_from_destination(
+        &self,
+        package_version: &PackageVersion,
+        destination: &Path,
+    ) -> RegistryResult<ArtifactCache> {
+        let Some(cache_root) = destination.ancestors().nth(3) else {
+            return Err(RegistryError::new(format!(
+                "crates.io artifact destination `{}` is not under a version-scoped cache directory",
+                destination.display()
+            )));
+        };
+
+        let expected_destination = version_scoped_state_directory(cache_root, package_version);
+        if expected_destination != destination {
+            return Err(RegistryError::new(format!(
+                "crates.io artifact destination `{}` does not match the version-scoped cache path `{}`",
+                destination.display(),
+                expected_destination.display()
+            )));
+        }
+
+        Ok(ArtifactCache::new(cache_root))
+    }
+
+    fn fetch_request_for(&self, artifact: &CratesArtifact) -> FetchRequest {
+        FetchRequest {
+            url: artifact.url.clone(),
+            artifact_metadata: Some(artifact.metadata.clone()),
+        }
+    }
+
     fn parse_latest_version(
         &self,
         package: &str,
@@ -175,13 +227,29 @@ impl Registry for CratesRegistry {
 
     fn download_artifact(
         &self,
-        _package: &PackageVersion,
-        _destination: &Path,
+        package: &PackageVersion,
+        destination: &Path,
     ) -> RegistryResult<DownloadedArtifact> {
-        Err(RegistryError::placeholder(
-            self.ecosystem(),
-            "download_artifact",
-        ))
+        let artifact = self.resolve_artifact(package)?;
+        let cache = self.cache_from_destination(package, destination)?;
+        let downloader =
+            SafeDownloader::new(self.download_policy_for(&artifact.url)?).map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to build crates.io downloader for `{}` version `{}`: {source}",
+                    package.package, package.version
+                ))
+            })?;
+        let request = self.fetch_request_for(&artifact);
+
+        cache
+            .fetch(&downloader, package, &request)
+            .map(|cached| cached.artifact)
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to download crates.io artifact for `{}` version `{}`: {source}",
+                    package.package, package.version
+                ))
+            })
     }
 
     fn unpack(&self, _artifact: &Path, _destination: &Path) -> RegistryResult<()> {
@@ -216,12 +284,17 @@ fn artifact_filename_for(package_version: &PackageVersion) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::http;
+    use crate::state::StateLayout;
 
     use super::*;
 
@@ -336,6 +409,67 @@ mod tests {
     }
 
     #[test]
+    fn downloads_artifact_through_safe_downloader_and_cache() {
+        let server = RequestSequenceServer::start_with_builder(|_base_url| {
+            vec![
+                ResponseSpec::head(200, "/api/v1/crates/clap/4.5.31/download", Some(18)),
+                ResponseSpec::redirect(
+                    "/api/v1/crates/clap/4.5.31/download",
+                    "/files/clap-4.5.31.crate",
+                ),
+                ResponseSpec::get(200, "/files/clap-4.5.31.crate", "crate tarball body"),
+                ResponseSpec::head(200, "/api/v1/crates/clap/4.5.31/download", Some(18)),
+            ]
+        });
+        let registry =
+            CratesRegistry::with_base_urls(server.metadata_base_url(), server.download_base_url());
+        let package = package_version("clap", "4.5.31");
+        let fixture = TestDir::new("crates-download-cache");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let destination = state_layout.artifact_cache_dir_for(&package);
+
+        let first = registry
+            .download_artifact(&package, &destination)
+            .expect("first artifact download should succeed");
+        let second = registry
+            .download_artifact(&package, &destination)
+            .expect("second artifact download should hit cache");
+
+        assert_eq!(first.path, destination.join("clap-4.5.31.crate"));
+        assert_eq!(second.path, first.path);
+        assert_eq!(
+            fs::read_to_string(&first.path).expect("artifact should be readable"),
+            "crate tarball body"
+        );
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "HEAD /api/v1/crates/clap/4.5.31/download".to_string(),
+                "GET /api/v1/crates/clap/4.5.31/download".to_string(),
+                "GET /files/clap-4.5.31.crate".to_string(),
+                "HEAD /api/v1/crates/clap/4.5.31/download".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_download_destination_outside_version_scoped_cache() {
+        let registry = CratesRegistry::new();
+        let package = package_version("clap", "4.5.31");
+        let fixture = TestDir::new("crates-download-destination");
+        let invalid_destination = fixture.path().join("artifacts").join("clap");
+
+        let error = registry
+            .cache_from_destination(&package, &invalid_destination)
+            .expect_err("invalid cache destination should fail");
+
+        assert!(error
+            .to_string()
+            .contains("does not match the version-scoped cache path"));
+    }
+
+    #[test]
     fn rejects_artifact_header_responses_without_content_length() {
         let server = RequestSequenceServer::start(vec![ResponseSpec::head(
             200,
@@ -420,9 +554,34 @@ mod tests {
         content_type: &'static str,
         body: String,
         content_length: Option<u64>,
+        extra_headers: Vec<(String, String)>,
     }
 
     impl ResponseSpec {
+        fn get(status_code: u16, path: &str, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "application/octet-stream",
+                body: body.into(),
+                content_length: None,
+                extra_headers: Vec::new(),
+            }
+        }
+
+        fn redirect(path: &str, location: &str) -> Self {
+            Self {
+                status_code: 302,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "text/plain",
+                body: String::new(),
+                content_length: Some(0),
+                extra_headers: vec![("Location".to_string(), location.to_string())],
+            }
+        }
+
         fn head(status_code: u16, path: &str, content_length: Option<u64>) -> Self {
             Self {
                 status_code,
@@ -431,6 +590,7 @@ mod tests {
                 content_type: "application/octet-stream",
                 body: String::new(),
                 content_length,
+                extra_headers: Vec::new(),
             }
         }
     }
@@ -493,6 +653,9 @@ mod tests {
                         response
                             .push_str(&format!("Content-Length: {}\r\n", response_spec.body.len()));
                     }
+                    for (name, value) in &response_spec.extra_headers {
+                        response.push_str(&format!("{name}: {value}\r\n"));
+                    }
                     response.push_str("\r\n");
                     if response_spec.method != "HEAD" {
                         response.push_str(&response_spec.body);
@@ -554,6 +717,32 @@ mod tests {
         request_path: Arc<Mutex<String>>,
         request_raw: Arc<Mutex<String>>,
         thread: Option<thread::JoinHandle<()>>,
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos();
+            let path = env::temp_dir().join(format!("pincushion-crates-{label}-{unique}"));
+            fs::create_dir_all(&path).expect("test dir should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     impl TestServer {
