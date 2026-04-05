@@ -46,8 +46,13 @@ cargo clippy --all-targets -- -D warnings  # lint
 
 - `Registry` trait — エコシステムごとのレジストリ操作を抽象化。テストでは `FakeRegistry` で差し替え
 - `RegistryPipeline` / `RegistryAdapters` — 全エコシステムのレジストリを束ねて一括 lookup
+- `artifact_pipeline` — changed package を shared に `download_artifact -> unpack -> inventory -> diff` へ流す staging layer。`ArtifactWorkspace` と `RegistryPipeline::process_version_changes(...)` を提供する
 - `Reviewer` trait + `CodexCommandRunner` / `ClaudeCodeCommandRunner` trait — レビューバックエンドとプロセス実行を分離し、テストでfakeに差し替え可能
 - `execute_check_with_lookup` — メインのチェックロジック。`lookup_latest_versions` をクロージャで受け取りテスト時にfake lookupを注入
+
+### Implementation note for fetch/unpack/diff tasks
+
+`artifact_pipeline.rs` は E1-1 の shared path で、現時点では CLI の `check` 実行経路にはまだ接続していない。`download_artifact` / `unpack` の ecosystem 実装が揃う前に `check` へ無理につなぐと runtime regression になりやすいので、段階タスクではまず shared pipeline と focused test を伸ばし、`check` wiring は後続タスクで行う。
 
 ### State directory layout
 
