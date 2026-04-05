@@ -307,8 +307,9 @@ mod tests {
     use flate2::Compression;
     use tar::{Builder, Header};
 
+    use crate::artifact_pipeline::{process_version_change, ArtifactWorkspace};
     use crate::http;
-    use crate::state::StateLayout;
+    use crate::state::{StateLayout, VersionChange};
 
     use super::*;
 
@@ -468,6 +469,84 @@ mod tests {
     }
 
     #[test]
+    fn processes_changed_crate_package_through_fetch_unpack_and_diff_summary() {
+        let old_crate = crate_archive_bytes(&[
+            ArchiveFile::new("crate/README.md", b"old readme\n"),
+            ArchiveFile::new(
+                "crate/src/lib.rs",
+                b"pub fn clap() {\n    println!(\"old\");\n}\n",
+            ),
+        ])
+        .expect("old crate should be created");
+        let new_crate = crate_archive_bytes(&[
+            ArchiveFile::new(
+                "crate/src/lib.rs",
+                b"pub fn clap() {\n    println!(\"new\");\n}\n",
+            ),
+            ArchiveFile::new("crate/src/derive.rs", b"pub fn derive() {}\n"),
+        ])
+        .expect("new crate should be created");
+        let old_size = old_crate.len() as u64;
+        let new_size = new_crate.len() as u64;
+
+        let server = RequestSequenceServer::start_with_builder(move |_base_url| {
+            vec![
+                ResponseSpec::head(200, "/api/v1/crates/clap/4.5.30/download", Some(old_size)),
+                ResponseSpec::redirect(
+                    "/api/v1/crates/clap/4.5.30/download",
+                    "/files/clap-4.5.30.crate",
+                ),
+                ResponseSpec::get(200, "/files/clap-4.5.30.crate", old_crate),
+                ResponseSpec::head(200, "/api/v1/crates/clap/4.5.31/download", Some(new_size)),
+                ResponseSpec::redirect(
+                    "/api/v1/crates/clap/4.5.31/download",
+                    "/files/clap-4.5.31.crate",
+                ),
+                ResponseSpec::get(200, "/files/clap-4.5.31.crate", new_crate),
+            ]
+        });
+        let registry =
+            CratesRegistry::with_base_urls(server.metadata_base_url(), server.download_base_url());
+        let fixture = TestDir::new("crates-changed-package");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let workspace = ArtifactWorkspace::from_state_layout(&state_layout);
+
+        let result = process_version_change(
+            &registry,
+            &version_change("clap", "4.5.30", "4.5.31"),
+            &workspace,
+        )
+        .expect("crate changed package should process successfully");
+
+        assert_eq!(result.previous_package.version, "4.5.30");
+        assert_eq!(result.current_package.version, "4.5.31");
+        assert_eq!(result.diff.files_added, 1);
+        assert_eq!(result.diff.files_removed, 1);
+        assert_eq!(result.diff.files_changed, 1);
+        assert_eq!(result.diff.added_paths, vec!["crate/src/derive.rs"]);
+        assert_eq!(result.diff.removed_paths, vec!["crate/README.md"]);
+        assert_eq!(result.diff.modified_paths, vec!["crate/src/lib.rs"]);
+        assert!(result.current_root.join("crate/src/derive.rs").exists());
+        assert_eq!(
+            fs::read_to_string(result.current_root.join("crate/src/lib.rs"))
+                .expect("crate source should exist"),
+            "pub fn clap() {\n    println!(\"new\");\n}\n"
+        );
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "HEAD /api/v1/crates/clap/4.5.30/download".to_string(),
+                "GET /api/v1/crates/clap/4.5.30/download".to_string(),
+                "GET /files/clap-4.5.30.crate".to_string(),
+                "HEAD /api/v1/crates/clap/4.5.31/download".to_string(),
+                "GET /api/v1/crates/clap/4.5.31/download".to_string(),
+                "GET /files/clap-4.5.31.crate".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn unpacks_crate_artifacts_safely() {
         let registry = CratesRegistry::new();
         let fixture = TestDir::new("crates-unpack");
@@ -591,25 +670,36 @@ mod tests {
         }
     }
 
+    fn version_change(
+        package: &str,
+        previous_version: &str,
+        current_version: &str,
+    ) -> VersionChange {
+        VersionChange {
+            package: package_version(package, current_version),
+            previous_version: previous_version.to_string(),
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct ResponseSpec {
         status_code: u16,
         method: String,
         path: String,
         content_type: &'static str,
-        body: String,
+        body: Vec<u8>,
         content_length: Option<u64>,
         extra_headers: Vec<(String, String)>,
     }
 
     impl ResponseSpec {
-        fn get(status_code: u16, path: &str, body: impl Into<String>) -> Self {
+        fn get(status_code: u16, path: &str, body: impl AsRef<[u8]>) -> Self {
             Self {
                 status_code,
                 method: "GET".to_string(),
                 path: path.to_string(),
                 content_type: "application/octet-stream",
-                body: body.into(),
+                body: body.as_ref().to_vec(),
                 content_length: None,
                 extra_headers: Vec::new(),
             }
@@ -621,7 +711,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: path.to_string(),
                 content_type: "text/plain",
-                body: String::new(),
+                body: Vec::new(),
                 content_length: Some(0),
                 extra_headers: vec![("Location".to_string(), location.to_string())],
             }
@@ -633,7 +723,7 @@ mod tests {
                 method: "HEAD".to_string(),
                 path: path.to_string(),
                 content_type: "application/octet-stream",
-                body: String::new(),
+                body: Vec::new(),
                 content_length,
                 extra_headers: Vec::new(),
             }
@@ -702,11 +792,12 @@ mod tests {
                         response.push_str(&format!("{name}: {value}\r\n"));
                     }
                     response.push_str("\r\n");
+                    let mut response_bytes = response.into_bytes();
                     if response_spec.method != "HEAD" {
-                        response.push_str(&response_spec.body);
+                        response_bytes.extend_from_slice(&response_spec.body);
                     }
                     stream
-                        .write_all(response.as_bytes())
+                        .write_all(&response_bytes)
                         .expect("response should be written");
                 }
             });
@@ -776,8 +867,12 @@ mod tests {
     }
 
     fn write_crate_archive(path: &Path, files: &[ArchiveFile<'_>]) -> std::io::Result<()> {
-        let file = fs::File::create(path)?;
-        let encoder = GzEncoder::new(file, Compression::default());
+        fs::write(path, crate_archive_bytes(files)?)
+    }
+
+    fn crate_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        let cursor = Cursor::new(Vec::new());
+        let encoder = GzEncoder::new(cursor, Compression::default());
         let mut builder = Builder::new(encoder);
 
         for file in files {
@@ -790,8 +885,8 @@ mod tests {
         }
 
         let encoder = builder.into_inner()?;
-        encoder.finish()?;
-        Ok(())
+        let cursor = encoder.finish()?;
+        Ok(cursor.into_inner())
     }
 
     struct TestDir {
