@@ -331,7 +331,8 @@ mod tests {
     use zip::write::FileOptions;
     use zip::ZipWriter;
 
-    use crate::state::StateLayout;
+    use crate::artifact_pipeline::{process_version_change, ArtifactWorkspace};
+    use crate::state::{StateLayout, VersionChange};
 
     use super::*;
 
@@ -634,6 +635,192 @@ mod tests {
     }
 
     #[test]
+    fn processes_changed_pypi_package_through_sdist_fetch_unpack_and_diff_summary() {
+        let old_sdist = tar_gz_archive_bytes(&[
+            ArchiveFile::new("README.md", b"old readme\n"),
+            ArchiveFile::new("src/requests/__init__.py", b"__version__ = '2.32.2'\n"),
+        ])
+        .expect("old sdist should be created");
+        let new_sdist = tar_gz_archive_bytes(&[
+            ArchiveFile::new("src/requests/__init__.py", b"__version__ = '2.32.3'\n"),
+            ArchiveFile::new("src/requests/api.py", b"def get():\n    return 'ok'\n"),
+        ])
+        .expect("new sdist should be created");
+        let old_size = old_sdist.len() as u64;
+        let new_size = new_sdist.len() as u64;
+
+        let server = RequestSequenceServer::start_with_builder(move |base_url| {
+            vec![
+                ResponseSpec::json(
+                    200,
+                    "/requests/json",
+                    pypi_release_metadata_body(
+                        base_url,
+                        vec![sdist_dist("requests-2.32.2.tar.gz", old_size)],
+                        vec![
+                            (
+                                "2.32.2",
+                                vec![sdist_dist("requests-2.32.2.tar.gz", old_size)],
+                            ),
+                            (
+                                "2.32.3",
+                                vec![sdist_dist("requests-2.32.3.tar.gz", new_size)],
+                            ),
+                        ],
+                    ),
+                ),
+                ResponseSpec::get(200, "/files/requests-2.32.2.tar.gz", old_sdist),
+                ResponseSpec::json(
+                    200,
+                    "/requests/json",
+                    pypi_release_metadata_body(
+                        base_url,
+                        vec![sdist_dist("requests-2.32.3.tar.gz", new_size)],
+                        vec![
+                            (
+                                "2.32.2",
+                                vec![sdist_dist("requests-2.32.2.tar.gz", old_size)],
+                            ),
+                            (
+                                "2.32.3",
+                                vec![sdist_dist("requests-2.32.3.tar.gz", new_size)],
+                            ),
+                        ],
+                    ),
+                ),
+                ResponseSpec::get(200, "/files/requests-2.32.3.tar.gz", new_sdist),
+            ]
+        });
+        let registry = PypiRegistry::with_metadata_base_url(server.base_url());
+        let fixture = TestDir::new("pypi-changed-sdist");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let workspace = ArtifactWorkspace::from_state_layout(&state_layout);
+
+        let result = process_version_change(
+            &registry,
+            &version_change("requests", "2.32.2", "2.32.3"),
+            &workspace,
+        )
+        .expect("sdist changed package should process successfully");
+
+        assert_eq!(result.diff.files_added, 1);
+        assert_eq!(result.diff.files_removed, 1);
+        assert_eq!(result.diff.files_changed, 1);
+        assert_eq!(result.diff.added_paths, vec!["src/requests/api.py"]);
+        assert_eq!(result.diff.removed_paths, vec!["README.md"]);
+        assert_eq!(result.diff.modified_paths, vec!["src/requests/__init__.py"]);
+        assert!(result.current_root.join("src/requests/api.py").exists());
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /requests/json".to_string(),
+                "GET /files/requests-2.32.2.tar.gz".to_string(),
+                "GET /requests/json".to_string(),
+                "GET /files/requests-2.32.3.tar.gz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn processes_changed_pypi_package_through_wheel_fallback_fetch_unpack_and_diff_summary() {
+        let old_wheel = zip_archive_bytes(&[
+            ArchiveFile::new("requests/__init__.py", b"__version__ = '2.32.2'\n"),
+            ArchiveFile::new(
+                "requests.dist-info/METADATA",
+                b"Name: requests\nVersion: 2.32.2\n",
+            ),
+        ])
+        .expect("old wheel should be created");
+        let new_wheel = zip_archive_bytes(&[
+            ArchiveFile::new("requests/__init__.py", b"__version__ = '2.32.3'\n"),
+            ArchiveFile::new("requests/api.py", b"def get():\n    return 'ok'\n"),
+            ArchiveFile::new(
+                "requests.dist-info/METADATA",
+                b"Name: requests\nVersion: 2.32.3\n",
+            ),
+        ])
+        .expect("new wheel should be created");
+        let old_size = old_wheel.len() as u64;
+        let new_size = new_wheel.len() as u64;
+
+        let server = RequestSequenceServer::start_with_builder(move |base_url| {
+            vec![
+                ResponseSpec::json(
+                    200,
+                    "/requests/json",
+                    pypi_release_metadata_body(
+                        base_url,
+                        vec![wheel_dist("requests-2.32.2-py3-none-any.whl", old_size)],
+                        vec![
+                            (
+                                "2.32.2",
+                                vec![wheel_dist("requests-2.32.2-py3-none-any.whl", old_size)],
+                            ),
+                            (
+                                "2.32.3",
+                                vec![wheel_dist("requests-2.32.3-py3-none-any.whl", new_size)],
+                            ),
+                        ],
+                    ),
+                ),
+                ResponseSpec::get(200, "/files/requests-2.32.2-py3-none-any.whl", old_wheel),
+                ResponseSpec::json(
+                    200,
+                    "/requests/json",
+                    pypi_release_metadata_body(
+                        base_url,
+                        vec![wheel_dist("requests-2.32.3-py3-none-any.whl", new_size)],
+                        vec![
+                            (
+                                "2.32.2",
+                                vec![wheel_dist("requests-2.32.2-py3-none-any.whl", old_size)],
+                            ),
+                            (
+                                "2.32.3",
+                                vec![wheel_dist("requests-2.32.3-py3-none-any.whl", new_size)],
+                            ),
+                        ],
+                    ),
+                ),
+                ResponseSpec::get(200, "/files/requests-2.32.3-py3-none-any.whl", new_wheel),
+            ]
+        });
+        let registry = PypiRegistry::with_metadata_base_url(server.base_url());
+        let fixture = TestDir::new("pypi-changed-wheel");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let workspace = ArtifactWorkspace::from_state_layout(&state_layout);
+
+        let result = process_version_change(
+            &registry,
+            &version_change("requests", "2.32.2", "2.32.3"),
+            &workspace,
+        )
+        .expect("wheel changed package should process successfully");
+
+        assert_eq!(result.diff.files_added, 1);
+        assert_eq!(result.diff.files_removed, 0);
+        assert_eq!(result.diff.files_changed, 2);
+        assert_eq!(result.diff.added_paths, vec!["requests/api.py"]);
+        assert!(result.diff.removed_paths.is_empty());
+        assert_eq!(
+            result.diff.modified_paths,
+            vec!["requests/__init__.py", "requests.dist-info/METADATA"]
+        );
+        assert!(result.current_root.join("requests/api.py").exists());
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /requests/json".to_string(),
+                "GET /files/requests-2.32.2-py3-none-any.whl".to_string(),
+                "GET /requests/json".to_string(),
+                "GET /files/requests-2.32.3-py3-none-any.whl".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_download_destination_outside_version_scoped_cache() {
         let registry = PypiRegistry::new();
         let package = package_version("requests", "2.32.3");
@@ -693,6 +880,17 @@ mod tests {
         }
     }
 
+    fn version_change(
+        package: &str,
+        previous_version: &str,
+        current_version: &str,
+    ) -> VersionChange {
+        VersionChange {
+            package: package_version(package, current_version),
+            previous_version: previous_version.to_string(),
+        }
+    }
+
     fn sdist(filename: &str, url: &str) -> PypiDistributionFile {
         PypiDistributionFile {
             filename: Some(filename.to_string()),
@@ -709,6 +907,72 @@ mod tests {
             url: Some(url.to_string()),
             size_bytes: None,
         }
+    }
+
+    fn sdist_dist(filename: &str, size: u64) -> serde_json::Value {
+        serde_json::json!({
+            "filename": filename,
+            "packagetype": "sdist",
+            "url": format!("__BASE__/files/{filename}"),
+            "size": size,
+        })
+    }
+
+    fn wheel_dist(filename: &str, size: u64) -> serde_json::Value {
+        serde_json::json!({
+            "filename": filename,
+            "packagetype": "bdist_wheel",
+            "url": format!("__BASE__/files/{filename}"),
+            "size": size,
+        })
+    }
+
+    fn pypi_release_metadata_body(
+        base_url: &str,
+        urls: Vec<serde_json::Value>,
+        releases: Vec<(&str, Vec<serde_json::Value>)>,
+    ) -> String {
+        let urls = urls
+            .into_iter()
+            .map(|mut value| {
+                if let Some(url) = value.get_mut("url") {
+                    *url = serde_json::Value::String(
+                        url.as_str()
+                            .unwrap_or_default()
+                            .replace("__BASE__", base_url),
+                    );
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let releases = releases
+            .into_iter()
+            .map(|(version, files)| {
+                let files = files
+                    .into_iter()
+                    .map(|mut value| {
+                        if let Some(url) = value.get_mut("url") {
+                            *url = serde_json::Value::String(
+                                url.as_str()
+                                    .unwrap_or_default()
+                                    .replace("__BASE__", base_url),
+                            );
+                        }
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                (version.to_string(), serde_json::Value::Array(files))
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+
+        serde_json::json!({
+            "info": {
+                "version": "2.32.3"
+            },
+            "urls": urls,
+            "releases": serde_json::Value::Object(releases),
+        })
+        .to_string()
     }
 
     #[derive(Debug, Clone)]
@@ -906,8 +1170,12 @@ mod tests {
     }
 
     fn write_tar_gz_archive(path: &Path, files: &[ArchiveFile<'_>]) -> std::io::Result<()> {
-        let file = fs::File::create(path)?;
-        let encoder = GzEncoder::new(file, Compression::default());
+        fs::write(path, tar_gz_archive_bytes(files)?)
+    }
+
+    fn tar_gz_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        let cursor = Cursor::new(Vec::new());
+        let encoder = GzEncoder::new(cursor, Compression::default());
         let mut builder = Builder::new(encoder);
 
         for file in files {
@@ -920,21 +1188,25 @@ mod tests {
         }
 
         let encoder = builder.into_inner()?;
-        encoder.finish()?;
-        Ok(())
+        let cursor = encoder.finish()?;
+        Ok(cursor.into_inner())
     }
 
     fn write_zip_archive(path: &Path, files: &[ArchiveFile<'_>]) -> std::io::Result<()> {
-        let file = fs::File::create(path)?;
-        let mut writer = ZipWriter::new(file);
+        fs::write(path, zip_archive_bytes(files)?)
+    }
+
+    fn zip_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(cursor);
 
         for file in files {
             writer.start_file(file.path, FileOptions::default())?;
             writer.write_all(file.contents)?;
         }
 
-        writer.finish()?;
-        Ok(())
+        let cursor = writer.finish()?;
+        Ok(cursor.into_inner())
     }
 
     struct TestDir {
