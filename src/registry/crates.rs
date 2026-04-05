@@ -521,12 +521,18 @@ mod tests {
 
         assert_eq!(result.previous_package.version, "4.5.30");
         assert_eq!(result.current_package.version, "4.5.31");
-        assert_eq!(result.diff.files_added, 1);
-        assert_eq!(result.diff.files_removed, 1);
-        assert_eq!(result.diff.files_changed, 1);
-        assert_eq!(result.diff.added_paths, vec!["crate/src/derive.rs"]);
-        assert_eq!(result.diff.removed_paths, vec!["crate/README.md"]);
-        assert_eq!(result.diff.modified_paths, vec!["crate/src/lib.rs"]);
+        assert_eq!(result.analysis.diff.files_added, 1);
+        assert_eq!(result.analysis.diff.files_removed, 1);
+        assert_eq!(result.analysis.diff.files_changed, 1);
+        assert_eq!(
+            result.analysis.diff.added_paths,
+            vec!["crate/src/derive.rs"]
+        );
+        assert_eq!(result.analysis.diff.removed_paths, vec!["crate/README.md"]);
+        assert_eq!(
+            result.analysis.diff.modified_paths,
+            vec!["crate/src/lib.rs"]
+        );
         assert!(result.current_root.join("crate/src/derive.rs").exists());
         assert_eq!(
             fs::read_to_string(result.current_root.join("crate/src/lib.rs"))

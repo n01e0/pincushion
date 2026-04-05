@@ -704,12 +704,18 @@ mod tests {
         )
         .expect("sdist changed package should process successfully");
 
-        assert_eq!(result.diff.files_added, 1);
-        assert_eq!(result.diff.files_removed, 1);
-        assert_eq!(result.diff.files_changed, 1);
-        assert_eq!(result.diff.added_paths, vec!["src/requests/api.py"]);
-        assert_eq!(result.diff.removed_paths, vec!["README.md"]);
-        assert_eq!(result.diff.modified_paths, vec!["src/requests/__init__.py"]);
+        assert_eq!(result.analysis.diff.files_added, 1);
+        assert_eq!(result.analysis.diff.files_removed, 1);
+        assert_eq!(result.analysis.diff.files_changed, 1);
+        assert_eq!(
+            result.analysis.diff.added_paths,
+            vec!["src/requests/api.py"]
+        );
+        assert_eq!(result.analysis.diff.removed_paths, vec!["README.md"]);
+        assert_eq!(
+            result.analysis.diff.modified_paths,
+            vec!["src/requests/__init__.py"]
+        );
         assert!(result.current_root.join("src/requests/api.py").exists());
         assert_eq!(
             server.request_log(),
@@ -799,13 +805,13 @@ mod tests {
         )
         .expect("wheel changed package should process successfully");
 
-        assert_eq!(result.diff.files_added, 1);
-        assert_eq!(result.diff.files_removed, 0);
-        assert_eq!(result.diff.files_changed, 2);
-        assert_eq!(result.diff.added_paths, vec!["requests/api.py"]);
-        assert!(result.diff.removed_paths.is_empty());
+        assert_eq!(result.analysis.diff.files_added, 1);
+        assert_eq!(result.analysis.diff.files_removed, 0);
+        assert_eq!(result.analysis.diff.files_changed, 2);
+        assert_eq!(result.analysis.diff.added_paths, vec!["requests/api.py"]);
+        assert!(result.analysis.diff.removed_paths.is_empty());
         assert_eq!(
-            result.diff.modified_paths,
+            result.analysis.diff.modified_paths,
             vec!["requests/__init__.py", "requests.dist-info/METADATA"]
         );
         assert!(result.current_root.join("requests/api.py").exists());

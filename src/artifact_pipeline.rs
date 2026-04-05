@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::diff::DiffSummary;
+use crate::diff::{DiffError, DiffSummary, ManifestDiff};
 use crate::inventory::{InventoryError, InventorySummary};
 use crate::registry::{
     DownloadedArtifact, PackageVersion, Registry, RegistryError, RegistryPipeline,
@@ -53,6 +53,12 @@ impl ArtifactWorkspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessedVersionAnalysis {
+    pub diff: DiffSummary,
+    pub manifest_diff: Option<ManifestDiff>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessedVersionChange {
     pub previous_package: PackageVersion,
     pub current_package: PackageVersion,
@@ -62,7 +68,7 @@ pub struct ProcessedVersionChange {
     pub current_root: PathBuf,
     pub previous_inventory: InventorySummary,
     pub current_inventory: InventorySummary,
-    pub diff: DiffSummary,
+    pub analysis: ProcessedVersionAnalysis,
 }
 
 #[derive(Debug)]
@@ -141,7 +147,17 @@ pub fn process_version_change(
             source: Box::new(source),
         }
     })?;
-    let diff = DiffSummary::between(&previous_inventory, &current_inventory);
+    let analysis = analyze_processed_version_change(
+        current_package.ecosystem,
+        &previous_root,
+        &current_root,
+        &previous_inventory,
+        &current_inventory,
+    )
+    .map_err(|source| ArtifactPipelineError::Analysis {
+        package: current_package.clone(),
+        source: Box::new(source),
+    })?;
 
     Ok(ProcessedVersionChange {
         previous_package,
@@ -152,7 +168,7 @@ pub fn process_version_change(
         current_root,
         previous_inventory,
         current_inventory,
-        diff,
+        analysis,
     })
 }
 
@@ -175,6 +191,10 @@ pub enum ArtifactPipelineError {
         package: PackageVersion,
         root: PathBuf,
         source: Box<InventoryError>,
+    },
+    Analysis {
+        package: PackageVersion,
+        source: Box<DiffError>,
     },
 }
 
@@ -216,6 +236,12 @@ impl fmt::Display for ArtifactPipelineError {
                 package.package_key(),
                 package.version
             ),
+            Self::Analysis { package, source } => write!(
+                f,
+                "failed to analyze unpacked diff for {} @ {}: {source}",
+                package.package_key(),
+                package.version
+            ),
         }
     }
 }
@@ -226,8 +252,25 @@ impl Error for ArtifactPipelineError {
             Self::Io { source, .. } => Some(source),
             Self::Download { source, .. } | Self::Unpack { source, .. } => Some(source),
             Self::Inventory { source, .. } => Some(source),
+            Self::Analysis { source, .. } => Some(source),
         }
     }
+}
+
+fn analyze_processed_version_change(
+    ecosystem: crate::registry::Ecosystem,
+    previous_root: &Path,
+    current_root: &Path,
+    previous_inventory: &InventorySummary,
+    current_inventory: &InventorySummary,
+) -> Result<ProcessedVersionAnalysis, DiffError> {
+    let diff = DiffSummary::between(previous_inventory, current_inventory);
+    let manifest_diff = ManifestDiff::extract(ecosystem, previous_root, current_root, &diff)?;
+
+    Ok(ProcessedVersionAnalysis {
+        diff,
+        manifest_diff,
+    })
 }
 
 fn download_package_artifact(
@@ -368,16 +411,28 @@ mod tests {
             .expect("npm change should process successfully");
         assert_eq!(npm_result.previous_package.version, "1.0.0");
         assert_eq!(npm_result.current_package.version, "1.1.0");
-        assert_eq!(npm_result.diff.files_added, 2);
-        assert_eq!(npm_result.diff.files_removed, 1);
-        assert_eq!(npm_result.diff.files_changed, 2);
+        assert_eq!(npm_result.analysis.diff.files_added, 2);
+        assert_eq!(npm_result.analysis.diff.files_removed, 1);
+        assert_eq!(npm_result.analysis.diff.files_changed, 2);
         assert_eq!(
-            npm_result.diff.added_paths,
+            npm_result
+                .analysis
+                .manifest_diff
+                .as_ref()
+                .expect("npm manifest diff should be present")
+                .paths,
+            vec!["package/package.json"]
+        );
+        assert_eq!(
+            npm_result.analysis.diff.added_paths,
             vec!["package/dist", "package/dist/index.js"]
         );
-        assert_eq!(npm_result.diff.removed_paths, vec!["package/README.md"]);
         assert_eq!(
-            npm_result.diff.modified_paths,
+            npm_result.analysis.diff.removed_paths,
+            vec!["package/README.md"]
+        );
+        assert_eq!(
+            npm_result.analysis.diff.modified_paths,
             vec!["package/index.js", "package/package.json"]
         );
         assert!(npm_result.previous_root.exists());
@@ -405,11 +460,20 @@ mod tests {
             .result
             .as_ref()
             .expect("crates change should process successfully");
-        assert_eq!(crates_result.diff.files_added, 0);
-        assert_eq!(crates_result.diff.files_removed, 0);
-        assert_eq!(crates_result.diff.files_changed, 2);
+        assert_eq!(crates_result.analysis.diff.files_added, 0);
+        assert_eq!(crates_result.analysis.diff.files_removed, 0);
+        assert_eq!(crates_result.analysis.diff.files_changed, 2);
         assert_eq!(
-            crates_result.diff.modified_paths,
+            crates_result
+                .analysis
+                .manifest_diff
+                .as_ref()
+                .expect("crate manifest diff should be present")
+                .paths,
+            vec!["demo-crate/Cargo.toml"]
+        );
+        assert_eq!(
+            crates_result.analysis.diff.modified_paths,
             vec!["demo-crate/Cargo.toml", "demo-crate/src/lib.rs"]
         );
 
