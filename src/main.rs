@@ -641,7 +641,9 @@ impl Error for CliError {}
 mod tests {
     use std::env;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::artifact_pipeline::{
@@ -919,6 +921,58 @@ mod tests {
     }
 
     #[test]
+    fn fail_closed_reviewer_writes_human_review_required_and_suspicious_report() {
+        let fixture = TestFixture::new("review-fail-closed");
+        fixture.write_config("npm:\n  - react\nreview:\n  provider: codex\n");
+        fixture.write_seen("{\n  \"packages\": {\n    \"npm:react\": \"19.0.0\"\n  }\n}\n");
+        fixture.write_executable("codex", "#!/bin/sh\necho reviewer boom >&2\nexit 23\n");
+
+        let _path_guard = ScopedPathOverride::prepend(fixture.root_path());
+        let mut stdout = Vec::new();
+        execute_check_with_processing(
+            fixture.config_path(),
+            &mut stdout,
+            |_config| vec![lookup_success(Ecosystem::Npm, "react", "19.1.0")],
+            |changes, _state_layout| {
+                vec![processed_success_with_signals(
+                    &changes[0],
+                    DiffSummary {
+                        files_added: 1,
+                        files_removed: 0,
+                        files_changed: 1,
+                        changed_paths: vec![
+                            "package.json".to_string(),
+                            "postinstall.js".to_string(),
+                        ],
+                        added_paths: vec!["postinstall.js".to_string()],
+                        removed_paths: Vec::new(),
+                        modified_paths: vec!["package.json".to_string()],
+                    },
+                    SignalAnalysis {
+                        signals: vec![Signal::InstallScriptAdded],
+                        interesting_files: vec![crate::diff::SuspiciousExcerpt {
+                            path: "postinstall.js".to_string(),
+                            reason: "new install script".to_string(),
+                            excerpt: "node postinstall.js".to_string(),
+                        }],
+                    },
+                )]
+            },
+        )
+        .expect("fail-closed review run should still complete");
+
+        let json_report = fixture
+            .root_path()
+            .join(".pincushion/reports/npm/react/19.0.0_to_19.1.0.json");
+        let json_contents =
+            fs::read_to_string(&json_report).expect("json report should be written");
+
+        assert!(json_contents.contains("human-review-required"));
+        assert!(json_contents.contains("\"verdict\": \"suspicious\""));
+        assert!(json_contents.contains("reviewer boom"));
+    }
+
+    #[test]
     fn reports_lookup_failures_as_partial_failure_and_persists_successful_versions() {
         let fixture = TestFixture::new("lookup-failure");
         fixture.write_config("npm:\n  - react\npypi:\n  - requests\nreview:\n  provider: none\n");
@@ -1123,6 +1177,59 @@ mod tests {
             )
             .expect("state directory should be created");
             fs::write(seen_path, contents).expect("seen state should be written");
+        }
+
+        fn write_executable(&self, name: &str, contents: &str) {
+            let path = self.root.join(name);
+            fs::write(&path, contents).expect("executable should be written");
+            let mut permissions = fs::metadata(&path)
+                .expect("executable metadata should be readable")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("executable permissions should update");
+        }
+    }
+
+    struct ScopedPathOverride {
+        original_path: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedPathOverride {
+        fn prepend(path: &Path) -> Self {
+            static PATH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let guard = PATH_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("path lock should succeed");
+            let original_path = env::var_os("PATH");
+            let mut combined = std::ffi::OsString::from(path.as_os_str());
+            if let Some(original) = &original_path {
+                combined.push(":");
+                combined.push(original);
+            }
+            // SAFETY: tests serialize PATH mutation with a global mutex and restore it on drop.
+            unsafe { env::set_var("PATH", combined) };
+
+            Self {
+                original_path,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedPathOverride {
+        fn drop(&mut self) {
+            match &self.original_path {
+                Some(value) => {
+                    // SAFETY: paired with the serialized PATH override in `prepend`.
+                    unsafe { env::set_var("PATH", value) };
+                }
+                None => {
+                    // SAFETY: paired with the serialized PATH override in `prepend`.
+                    unsafe { env::remove_var("PATH") };
+                }
+            }
         }
     }
 
