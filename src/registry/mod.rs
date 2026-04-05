@@ -203,7 +203,7 @@ impl<'a> RegistryPipeline<'a> {
             .collect()
     }
 
-    fn registry_for(&self, ecosystem: Ecosystem) -> &'a dyn Registry {
+    pub(crate) fn registry_for(&self, ecosystem: Ecosystem) -> &'a dyn Registry {
         match ecosystem {
             Ecosystem::Npm => self.npm,
             Ecosystem::Rubygems => self.rubygems,
