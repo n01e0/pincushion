@@ -25,7 +25,7 @@ use artifact_pipeline::ProcessedChangeResult;
 use config::{ConfigError, WatchlistConfig};
 use registry::{RegistryAdapters, RegistryLookupResult};
 use report::{JsonReportInput, JsonReportWriter, MarkdownReportWriter, ReportError};
-use review::{Confidence, ReviewOutput, ReviewVerdict};
+use review::{ReviewBackend, ReviewBackendError, ReviewInput, ReviewInputAnalysis};
 use state::{BaselineState, SeenState, StateError, StateLayout};
 
 const USAGE: &str = concat!(
@@ -104,6 +104,8 @@ where
     FProcess: FnOnce(&[state::VersionChange], &StateLayout) -> Vec<ProcessedChangeResult>,
 {
     let config = WatchlistConfig::load_from_path(config_path).map_err(AppError::Config)?;
+    let review_backend = ReviewBackend::from_provider(config.review.provider.clone())
+        .map_err(AppError::ReviewBackend)?;
     let state_layout =
         StateLayout::from_config_path(config_path).map_err(|source| AppError::StateLayout {
             path: config_path.to_path_buf(),
@@ -175,9 +177,12 @@ where
             state_layout
                 .save_seen_state(&next_seen_state)
                 .map_err(AppError::State)?;
-            let report_paths =
-                write_reports_for_processed_changes(&state_layout, &artifact_processing)
-                    .map_err(AppError::Report)?;
+            let report_paths = write_reports_for_processed_changes(
+                &state_layout,
+                &artifact_processing,
+                &review_backend,
+            )
+            .map_err(AppError::Report)?;
             print_change_summary(
                 stdout,
                 &state_layout,
@@ -372,6 +377,7 @@ struct GeneratedReportPaths {
 fn write_reports_for_processed_changes(
     state_layout: &StateLayout,
     artifact_processing: &[ProcessedChangeResult],
+    review_backend: &ReviewBackend,
 ) -> Result<Vec<GeneratedReportPaths>, ReportError> {
     let json_writer = JsonReportWriter::new(state_layout);
     let markdown_writer = MarkdownReportWriter::new(state_layout);
@@ -382,9 +388,10 @@ fn write_reports_for_processed_changes(
             continue;
         };
 
-        let review = placeholder_review_output(&result.analysis.signal_analysis);
+        let review_input = review_input_for_processed_change(result);
+        let review_decision = review_backend.review_fail_closed(&review_input);
         let input = JsonReportInput {
-            status: "ok",
+            status: &review_decision.status,
             ecosystem: result.current_package.ecosystem,
             package: &result.current_package.package,
             old_version: &result.previous_package.version,
@@ -397,7 +404,7 @@ fn write_reports_for_processed_changes(
                 .as_ref()
                 .map(|value| value.diff.clone()),
             interesting_files: &result.analysis.signal_analysis.interesting_files,
-            review: &review,
+            review: &review_decision.output,
         };
         let json_path = json_writer.write_analysis(input.clone())?;
         let markdown_path = markdown_writer.write_analysis(input)?;
@@ -411,21 +418,25 @@ fn write_reports_for_processed_changes(
     Ok(report_paths)
 }
 
-fn placeholder_review_output(signal_analysis: &signals::SignalAnalysis) -> ReviewOutput {
-    ReviewOutput {
-        verdict: ReviewVerdict::NeedsReview,
-        confidence: Confidence::Low,
-        reasons: vec![
-            "review stage is not wired into `pincushion check` yet; manual review required"
-                .to_string(),
-        ],
-        focus_files: signal_analysis
-            .interesting_files
-            .iter()
-            .map(|excerpt| excerpt.path.clone())
-            .collect(),
-        failure_reason: None,
-    }
+fn review_input_for_processed_change(
+    result: &artifact_pipeline::ProcessedVersionChange,
+) -> ReviewInput {
+    ReviewInput::from_analysis(
+        ReviewInputAnalysis {
+            ecosystem: result.current_package.ecosystem.as_str().to_string(),
+            package: result.current_package.package.clone(),
+            old_version: result.previous_package.version.clone(),
+            new_version: result.current_package.version.clone(),
+            manifest_diff: result
+                .analysis
+                .manifest_diff
+                .as_ref()
+                .map(|value| value.diff.clone()),
+            interesting_files: result.analysis.signal_analysis.interesting_files.clone(),
+        },
+        &result.analysis.diff,
+        &result.analysis.signal_analysis.signals,
+    )
 }
 
 fn print_generated_reports_summary<W>(
@@ -562,6 +573,7 @@ enum AppError {
     Config(ConfigError),
     StateLayout { path: PathBuf, source: io::Error },
     State(StateError),
+    ReviewBackend(ReviewBackendError),
     Report(ReportError),
     Output(io::Error),
 }
@@ -577,6 +589,7 @@ impl fmt::Display for AppError {
                 path.display()
             ),
             Self::State(error) => write!(f, "{error}"),
+            Self::ReviewBackend(error) => write!(f, "{error}"),
             Self::Report(error) => write!(f, "{error}"),
             Self::Output(error) => write!(f, "failed to write CLI output: {error}"),
         }
@@ -590,6 +603,7 @@ impl Error for AppError {
             Self::Config(error) => Some(error),
             Self::StateLayout { source, .. } => Some(source),
             Self::State(error) => Some(error),
+            Self::ReviewBackend(error) => Some(error),
             Self::Report(error) => Some(error),
             Self::Output(error) => Some(error),
         }
@@ -644,8 +658,8 @@ mod tests {
     use crate::state::VersionChange;
 
     use super::{
-        execute_check_with_lookup, execute_check_with_processing, parse_args, CheckOutcome,
-        CliCommand, ExitCodePolicy,
+        execute_check_with_lookup, execute_check_with_processing, parse_args,
+        review_input_for_processed_change, CheckOutcome, CliCommand, ExitCodePolicy,
     };
 
     #[test]
@@ -857,7 +871,51 @@ mod tests {
         assert!(json_contents.contains("postinstall.js"));
         assert!(markdown_contents.contains("install-script-added"));
         assert!(markdown_contents.contains("postinstall.js"));
-        assert!(json_contents.contains("manual review required"));
+        assert!(json_contents
+            .contains("review backend is disabled (provider=none); manual review required"));
+    }
+
+    #[test]
+    fn builds_review_input_from_real_processed_change_analysis() {
+        let change = version_change(Ecosystem::Npm, "react", "19.0.0", "19.1.0");
+        let processed = processed_success_with_signals(
+            &change,
+            DiffSummary {
+                files_added: 1,
+                files_removed: 2,
+                files_changed: 3,
+                changed_paths: vec!["package.json".to_string()],
+                added_paths: vec!["postinstall.js".to_string()],
+                removed_paths: vec!["README.md".to_string(), "docs.md".to_string()],
+                modified_paths: vec![
+                    "package.json".to_string(),
+                    "src/index.js".to_string(),
+                    "src/cli.js".to_string(),
+                ],
+            },
+            SignalAnalysis {
+                signals: vec![Signal::InstallScriptAdded],
+                interesting_files: vec![crate::diff::SuspiciousExcerpt {
+                    path: "postinstall.js".to_string(),
+                    reason: "new install script".to_string(),
+                    excerpt: "node postinstall.js".to_string(),
+                }],
+            },
+        );
+        let result = processed.result.expect("processed change should succeed");
+
+        let review_input = review_input_for_processed_change(&result);
+
+        assert_eq!(review_input.ecosystem, "npm");
+        assert_eq!(review_input.package, "react");
+        assert_eq!(review_input.old_version, "19.0.0");
+        assert_eq!(review_input.new_version, "19.1.0");
+        assert_eq!(review_input.summary.files_added, 1);
+        assert_eq!(review_input.summary.files_removed, 2);
+        assert_eq!(review_input.summary.files_changed, 3);
+        assert_eq!(review_input.summary.signals, vec!["install-script-added"]);
+        assert_eq!(review_input.interesting_files.len(), 1);
+        assert_eq!(review_input.interesting_files[0].path, "postinstall.js");
     }
 
     #[test]
@@ -955,6 +1013,22 @@ mod tests {
                 package: package.to_string(),
             },
             result: Err(RegistryError::new(message.to_string())),
+        }
+    }
+
+    fn version_change(
+        ecosystem: Ecosystem,
+        package: &str,
+        previous_version: &str,
+        current_version: &str,
+    ) -> VersionChange {
+        VersionChange {
+            package: PackageVersion {
+                ecosystem,
+                package: package.to_string(),
+                version: current_version.to_string(),
+            },
+            previous_version: previous_version.to_string(),
         }
     }
 
