@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::time::Duration;
 
+use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
+
+use crate::fetch::ArtifactMetadata;
 
 use super::{
     blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
@@ -9,27 +12,125 @@ use super::{
 };
 
 const DEFAULT_METADATA_BASE_URL: &str = "https://crates.io/api/v1/crates";
+const DEFAULT_DOWNLOAD_BASE_URL: &str = "https://crates.io/api/v1/crates";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CratesRegistry {
     metadata_base_url: String,
+    download_base_url: String,
 }
 
 impl CratesRegistry {
     pub fn new() -> Self {
         Self {
             metadata_base_url: DEFAULT_METADATA_BASE_URL.to_string(),
+            download_base_url: DEFAULT_DOWNLOAD_BASE_URL.to_string(),
         }
     }
 
     fn with_metadata_base_url(metadata_base_url: impl Into<String>) -> Self {
         Self {
             metadata_base_url: metadata_base_url.into().trim_end_matches('/').to_string(),
+            download_base_url: DEFAULT_DOWNLOAD_BASE_URL.to_string(),
+        }
+    }
+
+    fn with_base_urls(
+        metadata_base_url: impl Into<String>,
+        download_base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            metadata_base_url: metadata_base_url.into().trim_end_matches('/').to_string(),
+            download_base_url: download_base_url.into().trim_end_matches('/').to_string(),
         }
     }
 
     fn metadata_url(&self, package: &str) -> String {
         format!("{}/{}", self.metadata_base_url, package)
+    }
+
+    fn download_url(&self, package_version: &PackageVersion) -> String {
+        format!(
+            "{}/{}/{}/download",
+            self.download_base_url, package_version.package, package_version.version
+        )
+    }
+
+    fn fetch_package_metadata(&self, package: &str) -> RegistryResult<CratesPackageMetadata> {
+        blocking_metadata_client(Duration::from_secs(15))?
+            .get(self.metadata_url(package))
+            .send()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to fetch crates.io metadata for `{package}`: {source}"
+                ))
+            })?
+            .error_for_status()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "crates.io metadata request for `{package}` failed: {source}"
+                ))
+            })?
+            .json::<CratesPackageMetadata>()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to parse crates.io metadata for `{package}`: {source}"
+                ))
+            })
+    }
+
+    fn resolve_artifact(&self, package_version: &PackageVersion) -> RegistryResult<CratesArtifact> {
+        let download_url = self.download_url(package_version);
+        let filename = artifact_filename_for(package_version);
+        let size_bytes = self.fetch_artifact_size_bytes(&download_url)?;
+
+        Ok(CratesArtifact {
+            url: download_url,
+            metadata: ArtifactMetadata {
+                filename,
+                size_bytes: Some(size_bytes),
+            },
+        })
+    }
+
+    fn fetch_artifact_size_bytes(&self, download_url: &str) -> RegistryResult<u64> {
+        let response = blocking_metadata_client(Duration::from_secs(15))?
+            .head(download_url)
+            .send()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to fetch crates.io artifact headers for `{download_url}`: {source}"
+                ))
+            })?
+            .error_for_status()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "crates.io artifact header request for `{download_url}` failed: {source}"
+                ))
+            })?;
+
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .ok_or_else(|| {
+                RegistryError::new(format!(
+                    "crates.io artifact header response for `{download_url}` is missing content-length"
+                ))
+            })?
+            .to_str()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "crates.io artifact header response for `{download_url}` returned an invalid content-length: {source}"
+                ))
+            })?
+            .parse::<u64>()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "crates.io artifact header response for `{download_url}` returned a non-numeric content-length: {source}"
+                ))
+            })?;
+
+        Ok(content_length)
     }
 
     fn parse_latest_version(
@@ -68,27 +169,7 @@ impl Registry for CratesRegistry {
     }
 
     fn latest_version(&self, package: &str) -> RegistryResult<PackageVersion> {
-        let response = blocking_metadata_client(Duration::from_secs(15))?
-            .get(self.metadata_url(package))
-            .send()
-            .map_err(|source| {
-                RegistryError::new(format!(
-                    "failed to fetch crates.io metadata for `{package}`: {source}"
-                ))
-            })?
-            .error_for_status()
-            .map_err(|source| {
-                RegistryError::new(format!(
-                    "crates.io metadata request for `{package}` failed: {source}"
-                ))
-            })?;
-
-        let metadata = response.json::<CratesPackageMetadata>().map_err(|source| {
-            RegistryError::new(format!(
-                "failed to parse crates.io metadata for `{package}`: {source}"
-            ))
-        })?;
-
+        let metadata = self.fetch_package_metadata(package)?;
         self.parse_latest_version(package, metadata)
     }
 
@@ -108,6 +189,12 @@ impl Registry for CratesRegistry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CratesArtifact {
+    url: String,
+    metadata: ArtifactMetadata,
+}
+
 #[derive(Debug, Deserialize)]
 struct CratesPackageMetadata {
     #[serde(rename = "crate")]
@@ -118,6 +205,13 @@ struct CratesPackageMetadata {
 struct CratesPackage {
     max_stable_version: Option<String>,
     newest_version: Option<String>,
+}
+
+fn artifact_filename_for(package_version: &PackageVersion) -> String {
+    format!(
+        "{}-{}.crate",
+        package_version.package, package_version.version
+    )
 }
 
 #[cfg(test)]
@@ -195,6 +289,83 @@ mod tests {
     }
 
     #[test]
+    fn resolves_artifact_metadata_for_crate_download() {
+        let registry = CratesRegistry::new();
+        let artifact = CratesArtifact {
+            url: registry.download_url(&package_version("clap", "4.5.31")),
+            metadata: ArtifactMetadata {
+                filename: artifact_filename_for(&package_version("clap", "4.5.31")),
+                size_bytes: Some(4_321),
+            },
+        };
+
+        assert_eq!(
+            artifact.url,
+            "https://crates.io/api/v1/crates/clap/4.5.31/download"
+        );
+        assert_eq!(artifact.metadata.filename, "clap-4.5.31.crate");
+        assert_eq!(artifact.metadata.size_bytes, Some(4_321));
+    }
+
+    #[test]
+    fn resolves_artifact_via_http_download_head_lookup() {
+        let server = RequestSequenceServer::start_with_builder(|_base_url| {
+            vec![ResponseSpec::head(
+                200,
+                "/api/v1/crates/clap/4.5.31/download",
+                Some(4_321),
+            )]
+        });
+        let registry =
+            CratesRegistry::with_base_urls(server.metadata_base_url(), server.download_base_url());
+
+        let artifact = registry
+            .resolve_artifact(&package_version("clap", "4.5.31"))
+            .expect("crate artifact metadata should resolve");
+
+        assert_eq!(
+            artifact.url,
+            format!("{}/clap/4.5.31/download", server.download_base_url())
+        );
+        assert_eq!(artifact.metadata.filename, "clap-4.5.31.crate");
+        assert_eq!(artifact.metadata.size_bytes, Some(4_321));
+        assert_eq!(
+            server.request_log(),
+            vec!["HEAD /api/v1/crates/clap/4.5.31/download".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_artifact_header_responses_without_content_length() {
+        let server = RequestSequenceServer::start(vec![ResponseSpec::head(
+            200,
+            "/api/v1/crates/clap/4.5.31/download",
+            None,
+        )]);
+        let registry =
+            CratesRegistry::with_base_urls(server.metadata_base_url(), server.download_base_url());
+
+        let error = registry
+            .fetch_artifact_size_bytes(&format!(
+                "{}/clap/4.5.31/download",
+                server.download_base_url()
+            ))
+            .expect_err("missing content-length should fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "crates.io artifact header response for `{}/clap/4.5.31/download` is missing content-length",
+                server.download_base_url()
+            )
+        );
+        assert_eq!(
+            server.request_log(),
+            vec!["HEAD /api/v1/crates/clap/4.5.31/download".to_string()]
+        );
+    }
+
+    #[test]
     fn rejects_metadata_without_any_version() {
         let registry = CratesRegistry::new();
         let error = registry
@@ -231,6 +402,131 @@ mod tests {
         assert_eq!(package.version, "4.5.31");
         assert_eq!(package.package_key(), "crates:clap");
         assert_eq!(server.request_path(), "/clap");
+    }
+
+    fn package_version(package: &str, version: &str) -> PackageVersion {
+        PackageVersion {
+            ecosystem: Ecosystem::Crates,
+            package: package.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ResponseSpec {
+        status_code: u16,
+        method: String,
+        path: String,
+        content_type: &'static str,
+        body: String,
+        content_length: Option<u64>,
+    }
+
+    impl ResponseSpec {
+        fn head(status_code: u16, path: &str, content_length: Option<u64>) -> Self {
+            Self {
+                status_code,
+                method: "HEAD".to_string(),
+                path: path.to_string(),
+                content_type: "application/octet-stream",
+                body: String::new(),
+                content_length,
+            }
+        }
+    }
+
+    struct RequestSequenceServer {
+        root_url: String,
+        request_log: Arc<Mutex<Vec<String>>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl RequestSequenceServer {
+        fn start_with_builder(
+            build_responses: impl FnOnce(&str) -> Vec<ResponseSpec> + Send + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let address = listener.local_addr().expect("local addr should resolve");
+            let root_url = format!("http://{}", address);
+            let responses = build_responses(&root_url);
+            Self::spawn(listener, root_url, responses)
+        }
+
+        fn start(responses: Vec<ResponseSpec>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let address = listener.local_addr().expect("local addr should resolve");
+            let root_url = format!("http://{}", address);
+            Self::spawn(listener, root_url, responses)
+        }
+
+        fn spawn(listener: TcpListener, root_url: String, responses: Vec<ResponseSpec>) -> Self {
+            let request_log = Arc::new(Mutex::new(Vec::new()));
+            let request_log_for_thread = request_log.clone();
+
+            let thread = thread::spawn(move || {
+                for response_spec in responses {
+                    let (mut stream, _) = listener.accept().expect("request should arrive");
+                    let mut buffer = [0_u8; 4096];
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("request should be readable");
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let mut request_line_parts =
+                        request.lines().next().unwrap_or("").split_whitespace();
+                    let method = request_line_parts.next().unwrap_or("");
+                    let path = request_line_parts.next().unwrap_or("");
+                    request_log_for_thread
+                        .lock()
+                        .expect("request log lock should succeed")
+                        .push(format!("{method} {path}"));
+                    assert_eq!(method, response_spec.method, "unexpected request method");
+                    assert_eq!(path, response_spec.path, "unexpected request path");
+
+                    let mut response = format!(
+                        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nConnection: close\r\n",
+                        response_spec.status_code, response_spec.content_type
+                    );
+                    if let Some(content_length) = response_spec.content_length {
+                        response.push_str(&format!("Content-Length: {content_length}\r\n"));
+                    }
+                    if response_spec.method != "HEAD" && response_spec.content_length.is_none() {
+                        response
+                            .push_str(&format!("Content-Length: {}\r\n", response_spec.body.len()));
+                    }
+                    response.push_str("\r\n");
+                    if response_spec.method != "HEAD" {
+                        response.push_str(&response_spec.body);
+                    }
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("response should be written");
+                }
+            });
+
+            Self {
+                root_url,
+                request_log,
+                thread: Some(thread),
+            }
+        }
+
+        fn metadata_base_url(&self) -> String {
+            format!("{}/api/v1/crates", self.root_url)
+        }
+
+        fn download_base_url(&self) -> String {
+            format!("{}/api/v1/crates", self.root_url)
+        }
+
+        fn request_log(mut self) -> Vec<String> {
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("server thread should finish");
+            }
+            self.request_log
+                .lock()
+                .expect("request log lock should succeed")
+                .clone()
+        }
     }
 
     #[test]
