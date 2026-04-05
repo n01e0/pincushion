@@ -21,6 +21,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use artifact_pipeline::ProcessedChangeResult;
 use config::{ConfigError, WatchlistConfig};
 use registry::{RegistryAdapters, RegistryLookupResult};
 use state::{BaselineState, SeenState, StateError, StateLayout};
@@ -56,9 +57,17 @@ where
             Ok(ExitCode::SUCCESS)
         }
         CliCommand::Check { config_path } => {
-            execute_check_with_lookup(&config_path, stdout, |config| {
-                RegistryAdapters::default().lookup_latest_versions(config)
-            })
+            let adapters = RegistryAdapters::default();
+            execute_check_with_processing(
+                &config_path,
+                stdout,
+                |config| adapters.lookup_latest_versions(config),
+                |changes, state_layout| {
+                    adapters
+                        .pipeline()
+                        .process_version_changes_in_state_layout(changes, state_layout)
+                },
+            )
             .map(CheckOutcome::exit_code)
         }
     }
@@ -72,6 +81,25 @@ fn execute_check_with_lookup<W, F>(
 where
     W: Write,
     F: FnOnce(&WatchlistConfig) -> Vec<RegistryLookupResult>,
+{
+    execute_check_with_processing(
+        config_path,
+        stdout,
+        lookup_latest_versions,
+        |_changes, _state_layout| Vec::new(),
+    )
+}
+
+fn execute_check_with_processing<W, FLookup, FProcess>(
+    config_path: &Path,
+    stdout: &mut W,
+    lookup_latest_versions: FLookup,
+    process_changed_packages: FProcess,
+) -> Result<CheckOutcome, AppError>
+where
+    W: Write,
+    FLookup: FnOnce(&WatchlistConfig) -> Vec<RegistryLookupResult>,
+    FProcess: FnOnce(&[state::VersionChange], &StateLayout) -> Vec<ProcessedChangeResult>,
 {
     let config = WatchlistConfig::load_from_path(config_path).map_err(AppError::Config)?;
     let state_layout =
@@ -136,11 +164,16 @@ where
         }
         BaselineState::Existing(previous_seen_state) => {
             let detection = previous_seen_state.detect_changes(&current_versions);
+            let artifact_processing = if detection.changed.is_empty() {
+                Vec::new()
+            } else {
+                process_changed_packages(&detection.changed, &state_layout)
+            };
             let next_seen_state = SeenState::from_package_versions(&current_versions);
             state_layout
                 .save_seen_state(&next_seen_state)
                 .map_err(AppError::State)?;
-            print_change_summary(stdout, &state_layout, &detection)?;
+            print_change_summary(stdout, &state_layout, &detection, &artifact_processing)?;
             Ok(outcome)
         }
     }
@@ -177,6 +210,7 @@ fn print_change_summary<W>(
     stdout: &mut W,
     state_layout: &StateLayout,
     detection: &state::ChangeDetection,
+    artifact_processing: &[ProcessedChangeResult],
 ) -> Result<(), AppError>
 where
     W: Write,
@@ -207,6 +241,8 @@ where
             .map_err(AppError::Output)?;
         }
     }
+
+    print_artifact_processing_summary(stdout, artifact_processing)?;
 
     if !detection.unchanged.is_empty() {
         writeln!(stdout, "Unchanged:").map_err(AppError::Output)?;
@@ -240,6 +276,71 @@ where
         state_layout.seen_file().display()
     )
     .map_err(AppError::Output)?;
+
+    Ok(())
+}
+
+fn print_artifact_processing_summary<W>(
+    stdout: &mut W,
+    artifact_processing: &[ProcessedChangeResult],
+) -> Result<(), AppError>
+where
+    W: Write,
+{
+    if artifact_processing.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(stdout, "Artifact processing:").map_err(AppError::Output)?;
+
+    for processed in artifact_processing {
+        match &processed.result {
+            Ok(result) => {
+                writeln!(
+                    stdout,
+                    "  - {}: diff {} added, {} removed, {} changed",
+                    processed.change.package.package_key(),
+                    result.diff.files_added,
+                    result.diff.files_removed,
+                    result.diff.files_changed
+                )
+                .map_err(AppError::Output)?;
+
+                if !result.diff.added_paths.is_empty() {
+                    writeln!(stdout, "    added: {}", result.diff.added_paths.join(", "))
+                        .map_err(AppError::Output)?;
+                }
+                if !result.diff.removed_paths.is_empty() {
+                    writeln!(
+                        stdout,
+                        "    removed: {}",
+                        result.diff.removed_paths.join(", ")
+                    )
+                    .map_err(AppError::Output)?;
+                }
+                if !result.diff.modified_paths.is_empty() {
+                    writeln!(
+                        stdout,
+                        "    modified: {}",
+                        result.diff.modified_paths.join(", ")
+                    )
+                    .map_err(AppError::Output)?;
+                }
+                if !result.diff.has_changes() {
+                    writeln!(stdout, "    no file changes detected after unpack")
+                        .map_err(AppError::Output)?;
+                }
+            }
+            Err(error) => {
+                writeln!(
+                    stdout,
+                    "  - {}: artifact processing failed: {error}",
+                    processed.change.package.package_key()
+                )
+                .map_err(AppError::Output)?;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -417,11 +518,21 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::registry::{
-        Ecosystem, PackageCoordinate, PackageVersion, RegistryError, RegistryLookupResult,
+    use crate::artifact_pipeline::{
+        ArtifactPipelineError, ProcessedChangeResult, ProcessedVersionChange,
     };
+    use crate::diff::DiffSummary;
+    use crate::inventory::InventorySummary;
+    use crate::registry::{
+        DownloadedArtifact, Ecosystem, PackageCoordinate, PackageVersion, RegistryError,
+        RegistryLookupResult,
+    };
+    use crate::state::VersionChange;
 
-    use super::{execute_check_with_lookup, parse_args, CheckOutcome, CliCommand, ExitCodePolicy};
+    use super::{
+        execute_check_with_lookup, execute_check_with_processing, parse_args, CheckOutcome,
+        CliCommand, ExitCodePolicy,
+    };
 
     #[test]
     fn parses_check_command_with_config_path() {
@@ -503,6 +614,80 @@ mod tests {
         assert!(seen_contents.contains("\"npm:react\": \"19.1.0\""));
         assert!(seen_contents.contains("\"crates:clap\": \"4.5.31\""));
         assert!(seen_contents.contains("\"pypi:requests\": \"2.32.3\""));
+    }
+
+    #[test]
+    fn reports_artifact_processing_results_and_diff_summary_for_changed_packages() {
+        let fixture = TestFixture::new("artifact-summary");
+        fixture.write_config("npm:\n  - react\ncrates:\n  - clap\nreview:\n  provider: none\n");
+        fixture.write_seen(
+            "{\n  \"packages\": {\n    \"npm:react\": \"19.0.0\",\n    \"crates:clap\": \"4.5.30\"\n  }\n}\n",
+        );
+
+        let mut stdout = Vec::new();
+        let outcome = execute_check_with_processing(
+            fixture.config_path(),
+            &mut stdout,
+            |_config| {
+                vec![
+                    lookup_success(Ecosystem::Npm, "react", "19.1.0"),
+                    lookup_success(Ecosystem::Crates, "clap", "4.5.31"),
+                ]
+            },
+            |changes, _state_layout| {
+                assert_eq!(changes.len(), 2);
+                vec![
+                    processed_success(
+                        &changes[0],
+                        DiffSummary {
+                            files_added: 1,
+                            files_removed: 1,
+                            files_changed: 2,
+                            changed_paths: vec![
+                                "dist/index.js".to_string(),
+                                "README.md".to_string(),
+                                "package.json".to_string(),
+                                "src/index.js".to_string(),
+                            ],
+                            added_paths: vec!["dist/index.js".to_string()],
+                            removed_paths: vec!["README.md".to_string()],
+                            modified_paths: vec![
+                                "package.json".to_string(),
+                                "src/index.js".to_string(),
+                            ],
+                        },
+                    ),
+                    processed_failure(
+                        &changes[1],
+                        ArtifactPipelineError::Download {
+                            package: PackageVersion {
+                                ecosystem: Ecosystem::Crates,
+                                package: "clap".to_string(),
+                                version: "4.5.30".to_string(),
+                            },
+                            source: Box::new(RegistryError::placeholder(
+                                Ecosystem::Crates,
+                                "download_artifact",
+                            )),
+                        },
+                    ),
+                ]
+            },
+        )
+        .expect("artifact summary run should succeed");
+
+        assert_eq!(outcome.exit_code(), std::process::ExitCode::SUCCESS);
+
+        let output = String::from_utf8(stdout).expect("stdout should be utf8");
+        assert!(output.contains("Changed:"));
+        assert!(output.contains("Artifact processing:"));
+        assert!(output.contains("npm:react: diff 1 added, 1 removed, 2 changed"));
+        assert!(output.contains("added: dist/index.js"));
+        assert!(output.contains("removed: README.md"));
+        assert!(output.contains("modified: package.json, src/index.js"));
+        assert!(output.contains("crates:clap: artifact processing failed:"));
+        assert!(output
+            .contains("crates registry placeholder: download_artifact is not implemented yet"));
     }
 
     #[test]
@@ -600,6 +785,43 @@ mod tests {
                 package: package.to_string(),
             },
             result: Err(RegistryError::new(message.to_string())),
+        }
+    }
+
+    fn processed_success(change: &VersionChange, diff: DiffSummary) -> ProcessedChangeResult {
+        ProcessedChangeResult {
+            change: change.clone(),
+            result: Ok(ProcessedVersionChange {
+                previous_package: PackageVersion {
+                    ecosystem: change.package.ecosystem,
+                    package: change.package.package.clone(),
+                    version: change.previous_version.clone(),
+                },
+                current_package: change.package.clone(),
+                previous_artifact: DownloadedArtifact {
+                    source_url: Some("https://example.test/old".to_string()),
+                    path: PathBuf::from("/tmp/old-artifact"),
+                },
+                current_artifact: DownloadedArtifact {
+                    source_url: Some("https://example.test/new".to_string()),
+                    path: PathBuf::from("/tmp/new-artifact"),
+                },
+                previous_root: PathBuf::from("/tmp/old-unpacked"),
+                current_root: PathBuf::from("/tmp/new-unpacked"),
+                previous_inventory: InventorySummary::default(),
+                current_inventory: InventorySummary::default(),
+                diff,
+            }),
+        }
+    }
+
+    fn processed_failure(
+        change: &VersionChange,
+        error: ArtifactPipelineError,
+    ) -> ProcessedChangeResult {
+        ProcessedChangeResult {
+            change: change.clone(),
+            result: Err(error),
         }
     }
 
