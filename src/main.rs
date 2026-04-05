@@ -300,33 +300,37 @@ where
                     stdout,
                     "  - {}: diff {} added, {} removed, {} changed",
                     processed.change.package.package_key(),
-                    result.diff.files_added,
-                    result.diff.files_removed,
-                    result.diff.files_changed
+                    result.analysis.diff.files_added,
+                    result.analysis.diff.files_removed,
+                    result.analysis.diff.files_changed
                 )
                 .map_err(AppError::Output)?;
 
-                if !result.diff.added_paths.is_empty() {
-                    writeln!(stdout, "    added: {}", result.diff.added_paths.join(", "))
-                        .map_err(AppError::Output)?;
+                if !result.analysis.diff.added_paths.is_empty() {
+                    writeln!(
+                        stdout,
+                        "    added: {}",
+                        result.analysis.diff.added_paths.join(", ")
+                    )
+                    .map_err(AppError::Output)?;
                 }
-                if !result.diff.removed_paths.is_empty() {
+                if !result.analysis.diff.removed_paths.is_empty() {
                     writeln!(
                         stdout,
                         "    removed: {}",
-                        result.diff.removed_paths.join(", ")
+                        result.analysis.diff.removed_paths.join(", ")
                     )
                     .map_err(AppError::Output)?;
                 }
-                if !result.diff.modified_paths.is_empty() {
+                if !result.analysis.diff.modified_paths.is_empty() {
                     writeln!(
                         stdout,
                         "    modified: {}",
-                        result.diff.modified_paths.join(", ")
+                        result.analysis.diff.modified_paths.join(", ")
                     )
                     .map_err(AppError::Output)?;
                 }
-                if !result.diff.has_changes() {
+                if !result.analysis.diff.has_changes() {
                     writeln!(stdout, "    no file changes detected after unpack")
                         .map_err(AppError::Output)?;
                 }
@@ -519,7 +523,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::artifact_pipeline::{
-        ArtifactPipelineError, ProcessedChangeResult, ProcessedVersionChange,
+        ArtifactPipelineError, ProcessedChangeResult, ProcessedVersionAnalysis,
+        ProcessedVersionChange,
     };
     use crate::diff::DiffSummary;
     use crate::inventory::InventorySummary;
@@ -810,7 +815,10 @@ mod tests {
                 current_root: PathBuf::from("/tmp/new-unpacked"),
                 previous_inventory: InventorySummary::default(),
                 current_inventory: InventorySummary::default(),
-                diff,
+                analysis: ProcessedVersionAnalysis {
+                    diff,
+                    manifest_diff: None,
+                },
             }),
         }
     }

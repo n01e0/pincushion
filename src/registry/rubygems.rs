@@ -568,13 +568,13 @@ mod tests {
 
         assert_eq!(result.previous_package.version, "7.9.0");
         assert_eq!(result.current_package.version, "8.0.0");
-        assert_eq!(result.diff.files_added, 2);
-        assert_eq!(result.diff.files_removed, 1);
-        assert_eq!(result.diff.files_changed, 2);
-        assert_eq!(result.diff.added_paths, vec!["exe", "exe/rails"]);
-        assert_eq!(result.diff.removed_paths, vec!["README.md"]);
+        assert_eq!(result.analysis.diff.files_added, 2);
+        assert_eq!(result.analysis.diff.files_removed, 1);
+        assert_eq!(result.analysis.diff.files_changed, 2);
+        assert_eq!(result.analysis.diff.added_paths, vec!["exe", "exe/rails"]);
+        assert_eq!(result.analysis.diff.removed_paths, vec!["README.md"]);
         assert_eq!(
-            result.diff.modified_paths,
+            result.analysis.diff.modified_paths,
             vec!["lib/rails/version.rb", "lib/rails.rb"]
         );
         assert!(result.current_root.join("exe/rails").exists());

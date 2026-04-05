@@ -610,16 +610,19 @@ mod tests {
 
         assert_eq!(result.previous_package.version, "5.3.0");
         assert_eq!(result.current_package.version, "5.4.0");
-        assert_eq!(result.diff.files_added, 2);
-        assert_eq!(result.diff.files_removed, 1);
-        assert_eq!(result.diff.files_changed, 2);
+        assert_eq!(result.analysis.diff.files_added, 2);
+        assert_eq!(result.analysis.diff.files_removed, 1);
+        assert_eq!(result.analysis.diff.files_changed, 2);
         assert_eq!(
-            result.diff.added_paths,
+            result.analysis.diff.added_paths,
             vec!["package/dist", "package/dist/index.js"]
         );
-        assert_eq!(result.diff.removed_paths, vec!["package/README.md"]);
         assert_eq!(
-            result.diff.modified_paths,
+            result.analysis.diff.removed_paths,
+            vec!["package/README.md"]
+        );
+        assert_eq!(
+            result.analysis.diff.modified_paths,
             vec!["package/package.json", "package/source/index.js"]
         );
         assert!(result.current_root.join("package/dist/index.js").exists());
