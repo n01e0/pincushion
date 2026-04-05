@@ -1,8 +1,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use reqwest::header::CONTENT_LENGTH;
+use reqwest::Url;
 use serde::Deserialize;
 
+use crate::fetch::ArtifactMetadata;
 use crate::unpack::SafeUnpacker;
 
 use super::{
@@ -11,27 +14,182 @@ use super::{
 };
 
 const DEFAULT_METADATA_BASE_URL: &str = "https://rubygems.org/api/v1/gems";
+const DEFAULT_VERSION_METADATA_BASE_URL: &str = "https://rubygems.org/api/v2/rubygems";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RubygemsRegistry {
     metadata_base_url: String,
+    version_metadata_base_url: String,
 }
 
 impl RubygemsRegistry {
     pub fn new() -> Self {
         Self {
             metadata_base_url: DEFAULT_METADATA_BASE_URL.to_string(),
+            version_metadata_base_url: DEFAULT_VERSION_METADATA_BASE_URL.to_string(),
         }
     }
 
     fn with_metadata_base_url(metadata_base_url: impl Into<String>) -> Self {
         Self {
             metadata_base_url: metadata_base_url.into().trim_end_matches('/').to_string(),
+            version_metadata_base_url: DEFAULT_VERSION_METADATA_BASE_URL.to_string(),
+        }
+    }
+
+    fn with_base_urls(
+        metadata_base_url: impl Into<String>,
+        version_metadata_base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            metadata_base_url: metadata_base_url.into().trim_end_matches('/').to_string(),
+            version_metadata_base_url: version_metadata_base_url
+                .into()
+                .trim_end_matches('/')
+                .to_string(),
         }
     }
 
     fn metadata_url(&self, package: &str) -> String {
         format!("{}/{}.json", self.metadata_base_url, package)
+    }
+
+    fn version_metadata_url(&self, package_version: &PackageVersion) -> String {
+        format!(
+            "{}/{}/versions/{}.json",
+            self.version_metadata_base_url, package_version.package, package_version.version
+        )
+    }
+
+    fn fetch_package_metadata(&self, package: &str) -> RegistryResult<RubygemsPackageMetadata> {
+        blocking_metadata_client(Duration::from_secs(15))?
+            .get(self.metadata_url(package))
+            .send()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to fetch rubygems metadata for `{package}`: {source}"
+                ))
+            })?
+            .error_for_status()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "rubygems metadata request for `{package}` failed: {source}"
+                ))
+            })?
+            .json::<RubygemsPackageMetadata>()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to parse rubygems metadata for `{package}`: {source}"
+                ))
+            })
+    }
+
+    fn fetch_version_metadata(
+        &self,
+        package_version: &PackageVersion,
+    ) -> RegistryResult<RubygemsVersionMetadata> {
+        blocking_metadata_client(Duration::from_secs(15))?
+            .get(self.version_metadata_url(package_version))
+            .send()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to fetch rubygems version metadata for `{}` version `{}`: {source}",
+                    package_version.package, package_version.version
+                ))
+            })?
+            .error_for_status()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "rubygems version metadata request for `{}` version `{}` failed: {source}",
+                    package_version.package, package_version.version
+                ))
+            })?
+            .json::<RubygemsVersionMetadata>()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to parse rubygems version metadata for `{}` version `{}`: {source}",
+                    package_version.package, package_version.version
+                ))
+            })
+    }
+
+    fn resolve_artifact(
+        &self,
+        package_version: &PackageVersion,
+    ) -> RegistryResult<RubygemsArtifact> {
+        let metadata = self.fetch_version_metadata(package_version)?;
+        self.resolve_artifact_from_metadata(package_version, &metadata)
+    }
+
+    fn resolve_artifact_from_metadata(
+        &self,
+        package_version: &PackageVersion,
+        metadata: &RubygemsVersionMetadata,
+    ) -> RegistryResult<RubygemsArtifact> {
+        let gem_url = metadata
+            .gem_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                RegistryError::new(format!(
+                    "rubygems version metadata for `{}` version `{}` is missing gem_uri",
+                    package_version.package, package_version.version
+                ))
+            })?;
+        let filename = artifact_filename_from_url(gem_url)?;
+        let size_bytes = match metadata.size_bytes {
+            Some(size_bytes) => size_bytes,
+            None => self.fetch_artifact_size_bytes(gem_url)?,
+        };
+
+        Ok(RubygemsArtifact {
+            url: gem_url.to_string(),
+            metadata: ArtifactMetadata {
+                filename,
+                size_bytes: Some(size_bytes),
+            },
+        })
+    }
+
+    fn fetch_artifact_size_bytes(&self, gem_url: &str) -> RegistryResult<u64> {
+        let response = blocking_metadata_client(Duration::from_secs(15))?
+            .head(gem_url)
+            .send()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to fetch rubygems artifact headers for `{gem_url}`: {source}"
+                ))
+            })?
+            .error_for_status()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "rubygems artifact header request for `{gem_url}` failed: {source}"
+                ))
+            })?;
+
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .ok_or_else(|| {
+                RegistryError::new(format!(
+                    "rubygems artifact header response for `{gem_url}` is missing content-length"
+                ))
+            })?
+            .to_str()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "rubygems artifact header response for `{gem_url}` returned an invalid content-length: {source}"
+                ))
+            })?
+            .parse::<u64>()
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "rubygems artifact header response for `{gem_url}` returned a non-numeric content-length: {source}"
+                ))
+            })?;
+
+        Ok(content_length)
     }
 
     fn parse_latest_version(
@@ -68,29 +226,7 @@ impl Registry for RubygemsRegistry {
     }
 
     fn latest_version(&self, package: &str) -> RegistryResult<PackageVersion> {
-        let response = blocking_metadata_client(Duration::from_secs(15))?
-            .get(self.metadata_url(package))
-            .send()
-            .map_err(|source| {
-                RegistryError::new(format!(
-                    "failed to fetch rubygems metadata for `{package}`: {source}"
-                ))
-            })?
-            .error_for_status()
-            .map_err(|source| {
-                RegistryError::new(format!(
-                    "rubygems metadata request for `{package}` failed: {source}"
-                ))
-            })?;
-
-        let metadata = response
-            .json::<RubygemsPackageMetadata>()
-            .map_err(|source| {
-                RegistryError::new(format!(
-                    "failed to parse rubygems metadata for `{package}`: {source}"
-                ))
-            })?;
-
+        let metadata = self.fetch_package_metadata(package)?;
         self.parse_latest_version(package, metadata)
     }
 
@@ -118,9 +254,40 @@ impl Registry for RubygemsRegistry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RubygemsArtifact {
+    url: String,
+    metadata: ArtifactMetadata,
+}
+
 #[derive(Debug, Deserialize)]
 struct RubygemsPackageMetadata {
     version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RubygemsVersionMetadata {
+    gem_uri: Option<String>,
+    #[serde(default, alias = "size")]
+    size_bytes: Option<u64>,
+}
+
+fn artifact_filename_from_url(url: &str) -> RegistryResult<String> {
+    let parsed = Url::parse(url).map_err(|source| {
+        RegistryError::new(format!(
+            "rubygems artifact url `{url}` is invalid: {source}"
+        ))
+    })?;
+    let filename = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .ok_or_else(|| {
+            RegistryError::new(format!(
+                "rubygems artifact url `{url}` does not contain a file name"
+            ))
+        })?;
+
+    Ok(filename.to_string())
 }
 
 #[cfg(test)]
@@ -175,6 +342,103 @@ mod tests {
     }
 
     #[test]
+    fn resolves_artifact_metadata_from_version_metadata() {
+        let registry = RubygemsRegistry::new();
+        let package = package_version("rails", "8.0.0");
+        let artifact = registry
+            .resolve_artifact_from_metadata(
+                &package,
+                &RubygemsVersionMetadata {
+                    gem_uri: Some("https://rubygems.org/gems/rails-8.0.0.gem".to_string()),
+                    size_bytes: Some(42),
+                },
+            )
+            .expect("artifact metadata should resolve");
+
+        assert_eq!(artifact.url, "https://rubygems.org/gems/rails-8.0.0.gem");
+        assert_eq!(artifact.metadata.filename, "rails-8.0.0.gem");
+        assert_eq!(artifact.metadata.size_bytes, Some(42));
+    }
+
+    #[test]
+    fn resolves_artifact_via_version_metadata_and_head_size_lookup() {
+        let server = RequestSequenceServer::start_with_builder(|base_url| {
+            vec![
+                ResponseSpec::json(
+                    200,
+                    "/api/v2/rubygems/rails/versions/8.0.0.json",
+                    format!("{{\"gem_uri\":\"{base_url}/gems/rails-8.0.0.gem\"}}"),
+                ),
+                ResponseSpec::head(200, "/gems/rails-8.0.0.gem", Some(42)),
+            ]
+        });
+        let registry = RubygemsRegistry::with_base_urls(server.v1_base_url(), server.v2_base_url());
+
+        let artifact = registry
+            .resolve_artifact(&package_version("rails", "8.0.0"))
+            .expect("artifact metadata should resolve");
+
+        assert_eq!(
+            artifact.url,
+            format!("{}/gems/rails-8.0.0.gem", server.root_url())
+        );
+        assert_eq!(artifact.metadata.filename, "rails-8.0.0.gem");
+        assert_eq!(artifact.metadata.size_bytes, Some(42));
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /api/v2/rubygems/rails/versions/8.0.0.json".to_string(),
+                "HEAD /gems/rails-8.0.0.gem".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_artifact_resolution_when_gem_uri_is_missing() {
+        let registry = RubygemsRegistry::new();
+        let error = registry
+            .resolve_artifact_from_metadata(
+                &package_version("rails", "8.0.0"),
+                &RubygemsVersionMetadata {
+                    gem_uri: None,
+                    size_bytes: None,
+                },
+            )
+            .expect_err("missing gem_uri should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "rubygems version metadata for `rails` version `8.0.0` is missing gem_uri"
+        );
+    }
+
+    #[test]
+    fn rejects_artifact_header_responses_without_content_length() {
+        let server = RequestSequenceServer::start(vec![ResponseSpec::head(
+            200,
+            "/gems/rails-8.0.0.gem",
+            None,
+        )]);
+        let registry = RubygemsRegistry::new();
+
+        let error = registry
+            .fetch_artifact_size_bytes(&format!("{}/gems/rails-8.0.0.gem", server.root_url()))
+            .expect_err("missing content-length should fail");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "rubygems artifact header response for `{}/gems/rails-8.0.0.gem` is missing content-length",
+                server.root_url()
+            )
+        );
+        assert_eq!(
+            server.request_log(),
+            vec!["HEAD /gems/rails-8.0.0.gem".to_string()]
+        );
+    }
+
+    #[test]
     fn rejects_rubygems_metadata_without_version() {
         let registry = RubygemsRegistry::new();
         let error = registry
@@ -200,6 +464,146 @@ mod tests {
         assert_eq!(package.version, "8.0.0");
         assert_eq!(package.package_key(), "rubygems:rails");
         assert_eq!(server.request_path(), "/rails.json");
+    }
+
+    fn package_version(package: &str, version: &str) -> PackageVersion {
+        PackageVersion {
+            ecosystem: Ecosystem::Rubygems,
+            package: package.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ResponseSpec {
+        status_code: u16,
+        method: String,
+        path: String,
+        content_type: &'static str,
+        body: String,
+        content_length: Option<u64>,
+    }
+
+    impl ResponseSpec {
+        fn json(status_code: u16, path: &str, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "application/json",
+                body: body.into(),
+                content_length: None,
+            }
+        }
+
+        fn head(status_code: u16, path: &str, content_length: Option<u64>) -> Self {
+            Self {
+                status_code,
+                method: "HEAD".to_string(),
+                path: path.to_string(),
+                content_type: "application/octet-stream",
+                body: String::new(),
+                content_length,
+            }
+        }
+    }
+
+    struct RequestSequenceServer {
+        root_url: String,
+        request_log: Arc<Mutex<Vec<String>>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl RequestSequenceServer {
+        fn start_with_builder(
+            build_responses: impl FnOnce(&str) -> Vec<ResponseSpec> + Send + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let address = listener.local_addr().expect("local addr should resolve");
+            let root_url = format!("http://{}", address);
+            let responses = build_responses(&root_url);
+            Self::spawn(listener, root_url, responses)
+        }
+
+        fn start(responses: Vec<ResponseSpec>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let address = listener.local_addr().expect("local addr should resolve");
+            let root_url = format!("http://{}", address);
+            Self::spawn(listener, root_url, responses)
+        }
+
+        fn spawn(listener: TcpListener, root_url: String, responses: Vec<ResponseSpec>) -> Self {
+            let request_log = Arc::new(Mutex::new(Vec::new()));
+            let request_log_for_thread = request_log.clone();
+
+            let thread = thread::spawn(move || {
+                for response_spec in responses {
+                    let (mut stream, _) = listener.accept().expect("request should arrive");
+                    let mut buffer = [0_u8; 4096];
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("request should be readable");
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let mut request_line_parts =
+                        request.lines().next().unwrap_or("").split_whitespace();
+                    let method = request_line_parts.next().unwrap_or("");
+                    let path = request_line_parts.next().unwrap_or("");
+                    request_log_for_thread
+                        .lock()
+                        .expect("request log lock should succeed")
+                        .push(format!("{method} {path}"));
+                    assert_eq!(method, response_spec.method, "unexpected request method");
+                    assert_eq!(path, response_spec.path, "unexpected request path");
+
+                    let mut response = format!(
+                        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nConnection: close\r\n",
+                        response_spec.status_code, response_spec.content_type
+                    );
+                    if let Some(content_length) = response_spec.content_length {
+                        response.push_str(&format!("Content-Length: {content_length}\r\n"));
+                    }
+                    if response_spec.method != "HEAD" && response_spec.content_length.is_none() {
+                        response
+                            .push_str(&format!("Content-Length: {}\r\n", response_spec.body.len()));
+                    }
+                    response.push_str("\r\n");
+                    if response_spec.method != "HEAD" {
+                        response.push_str(&response_spec.body);
+                    }
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("response should be written");
+                }
+            });
+
+            Self {
+                root_url,
+                request_log,
+                thread: Some(thread),
+            }
+        }
+
+        fn root_url(&self) -> &str {
+            &self.root_url
+        }
+
+        fn v1_base_url(&self) -> String {
+            format!("{}/api/v1/gems", self.root_url)
+        }
+
+        fn v2_base_url(&self) -> String {
+            format!("{}/api/v2/rubygems", self.root_url)
+        }
+
+        fn request_log(mut self) -> Vec<String> {
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("server thread should finish");
+            }
+            self.request_log
+                .lock()
+                .expect("request log lock should succeed")
+                .clone()
+        }
     }
 
     struct TestServer {
