@@ -355,7 +355,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tar::Builder;
 
-    use crate::state::StateLayout;
+    use crate::artifact_pipeline::{process_version_change, ArtifactWorkspace};
+    use crate::state::{StateLayout, VersionChange};
 
     use super::*;
 
@@ -556,6 +557,89 @@ mod tests {
     }
 
     #[test]
+    fn processes_changed_npm_package_through_fetch_unpack_and_diff_summary() {
+        let old_tarball = tar_gz_archive_bytes(&[
+            ArchiveFile::new(
+                "package/package.json",
+                br#"{"name":"chalk","version":"5.3.0"}"#,
+            ),
+            ArchiveFile::new(
+                "package/source/index.js",
+                b"export const version = 'old';\n",
+            ),
+            ArchiveFile::new("package/README.md", b"old readme\n"),
+        ])
+        .expect("old tarball should be created");
+        let new_tarball = tar_gz_archive_bytes(&[
+            ArchiveFile::new(
+                "package/package.json",
+                br#"{"name":"chalk","version":"5.4.0"}"#,
+            ),
+            ArchiveFile::new(
+                "package/source/index.js",
+                b"export const version = 'new';\n",
+            ),
+            ArchiveFile::new("package/dist/index.js", b"export const bundle = true;\n"),
+        ])
+        .expect("new tarball should be created");
+        let old_size = old_tarball.len();
+        let new_size = new_tarball.len();
+
+        let server = RequestSequenceServer::start_with_builder(move |base_url| {
+            let metadata_body =
+                npm_versions_metadata_body(base_url, old_size as u64, new_size as u64);
+            vec![
+                ResponseSpec::json(200, "/chalk", metadata_body.clone()),
+                ResponseSpec::get(200, "/chalk/-/chalk-5.3.0.tgz", old_tarball),
+                ResponseSpec::json(200, "/chalk", metadata_body),
+                ResponseSpec::get(200, "/chalk/-/chalk-5.4.0.tgz", new_tarball),
+            ]
+        });
+        let registry = NpmRegistry::with_metadata_base_url(server.base_url());
+        let fixture = TestDir::new("npm-changed-package");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let workspace = ArtifactWorkspace::from_state_layout(&state_layout);
+
+        let result = process_version_change(
+            &registry,
+            &version_change("chalk", "5.3.0", "5.4.0"),
+            &workspace,
+        )
+        .expect("npm changed package should process successfully");
+
+        assert_eq!(result.previous_package.version, "5.3.0");
+        assert_eq!(result.current_package.version, "5.4.0");
+        assert_eq!(result.diff.files_added, 2);
+        assert_eq!(result.diff.files_removed, 1);
+        assert_eq!(result.diff.files_changed, 2);
+        assert_eq!(
+            result.diff.added_paths,
+            vec!["package/dist", "package/dist/index.js"]
+        );
+        assert_eq!(result.diff.removed_paths, vec!["package/README.md"]);
+        assert_eq!(
+            result.diff.modified_paths,
+            vec!["package/package.json", "package/source/index.js"]
+        );
+        assert!(result.current_root.join("package/dist/index.js").exists());
+        assert_eq!(
+            fs::read_to_string(result.current_root.join("package/source/index.js"))
+                .expect("unpacked file should be readable"),
+            "export const version = 'new';\n"
+        );
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /chalk".to_string(),
+                "GET /chalk/-/chalk-5.3.0.tgz".to_string(),
+                "GET /chalk".to_string(),
+                "GET /chalk/-/chalk-5.4.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_download_destination_outside_version_scoped_cache() {
         let registry = NpmRegistry::new();
         let package = package_version("chalk", "5.4.0");
@@ -668,35 +752,46 @@ mod tests {
         }
     }
 
+    fn version_change(
+        package: &str,
+        previous_version: &str,
+        current_version: &str,
+    ) -> VersionChange {
+        VersionChange {
+            package: package_version(package, current_version),
+            previous_version: previous_version.to_string(),
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct ResponseSpec {
         status_code: u16,
         method: String,
         path: String,
         content_type: &'static str,
-        body: String,
+        body: Vec<u8>,
         content_length: Option<u64>,
     }
 
     impl ResponseSpec {
-        fn json(status_code: u16, path: &str, body: impl Into<String>) -> Self {
+        fn json(status_code: u16, path: &str, body: impl AsRef<[u8]>) -> Self {
             Self {
                 status_code,
                 method: "GET".to_string(),
                 path: path.to_string(),
                 content_type: "application/json",
-                body: body.into(),
+                body: body.as_ref().to_vec(),
                 content_length: None,
             }
         }
 
-        fn get(status_code: u16, path: &str, body: impl Into<String>) -> Self {
+        fn get(status_code: u16, path: &str, body: impl AsRef<[u8]>) -> Self {
             Self {
                 status_code,
                 method: "GET".to_string(),
                 path: path.to_string(),
                 content_type: "application/octet-stream",
-                body: body.into(),
+                body: body.as_ref().to_vec(),
                 content_length: None,
             }
         }
@@ -707,7 +802,7 @@ mod tests {
                 method: "HEAD".to_string(),
                 path: path.to_string(),
                 content_type: "application/octet-stream",
-                body: String::new(),
+                body: Vec::new(),
                 content_length,
             }
         }
@@ -772,11 +867,12 @@ mod tests {
                             .push_str(&format!("Content-Length: {}\r\n", response_spec.body.len()));
                     }
                     response.push_str("\r\n");
+                    let mut response_bytes = response.into_bytes();
                     if response_spec.method != "HEAD" {
-                        response.push_str(&response_spec.body);
+                        response_bytes.extend_from_slice(&response_spec.body);
                     }
                     stream
-                        .write_all(response.as_bytes())
+                        .write_all(&response_bytes)
                         .expect("response should be written");
                 }
             });
@@ -905,8 +1001,12 @@ mod tests {
     }
 
     fn write_tar_gz_archive(path: &Path, files: &[ArchiveFile<'_>]) -> std::io::Result<()> {
-        let file = fs::File::create(path)?;
-        let encoder = GzEncoder::new(file, Compression::default());
+        fs::write(path, tar_gz_archive_bytes(files)?)
+    }
+
+    fn tar_gz_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let encoder = GzEncoder::new(cursor, Compression::default());
         let mut builder = Builder::new(encoder);
 
         for file in files {
@@ -919,7 +1019,30 @@ mod tests {
         }
 
         let encoder = builder.into_inner()?;
-        encoder.finish()?;
-        Ok(())
+        let cursor = encoder.finish()?;
+        Ok(cursor.into_inner())
+    }
+
+    fn npm_versions_metadata_body(base_url: &str, old_size: u64, new_size: u64) -> String {
+        serde_json::json!({
+            "dist-tags": {
+                "latest": "5.4.0"
+            },
+            "versions": {
+                "5.3.0": {
+                    "dist": {
+                        "tarball": format!("{base_url}/chalk/-/chalk-5.3.0.tgz"),
+                        "size": old_size,
+                    }
+                },
+                "5.4.0": {
+                    "dist": {
+                        "tarball": format!("{base_url}/chalk/-/chalk-5.4.0.tgz"),
+                        "size": new_size,
+                    }
+                }
+            }
+        })
+        .to_string()
     }
 }
