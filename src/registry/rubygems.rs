@@ -361,14 +361,19 @@ fn artifact_filename_from_url(url: &str) -> RegistryResult<String> {
 mod tests {
     use std::env;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::state::StateLayout;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
+
+    use crate::artifact_pipeline::{process_version_change, ArtifactWorkspace};
+    use crate::state::{StateLayout, VersionChange};
 
     use super::*;
 
@@ -514,6 +519,82 @@ mod tests {
     }
 
     #[test]
+    fn processes_changed_rubygems_package_through_fetch_unpack_and_diff_summary() {
+        let old_gem = gem_archive_bytes(&[
+            ArchiveFile::new("README.md", b"old readme\n"),
+            ArchiveFile::new("lib/rails.rb", b"module Rails\nend\n"),
+            ArchiveFile::new("lib/rails/version.rb", b"VERSION = \"7.9.0\"\n"),
+        ])
+        .expect("old gem should be created");
+        let new_gem = gem_archive_bytes(&[
+            ArchiveFile::new("lib/rails.rb", b"module Rails\n  VERSION = true\nend\n"),
+            ArchiveFile::new("lib/rails/version.rb", b"VERSION = \"8.0.0\"\n"),
+            ArchiveFile::new("exe/rails", b"#!/usr/bin/env ruby\nputs :rails\n"),
+        ])
+        .expect("new gem should be created");
+        let old_size = old_gem.len() as u64;
+        let new_size = new_gem.len() as u64;
+
+        let server = RequestSequenceServer::start_with_builder(move |base_url| {
+            let old_metadata = rubygems_version_metadata_body(base_url, "7.9.0", old_size);
+            let new_metadata = rubygems_version_metadata_body(base_url, "8.0.0", new_size);
+            vec![
+                ResponseSpec::json(
+                    200,
+                    "/api/v2/rubygems/rails/versions/7.9.0.json",
+                    old_metadata,
+                ),
+                ResponseSpec::get(200, "/gems/rails-7.9.0.gem", old_gem),
+                ResponseSpec::json(
+                    200,
+                    "/api/v2/rubygems/rails/versions/8.0.0.json",
+                    new_metadata,
+                ),
+                ResponseSpec::get(200, "/gems/rails-8.0.0.gem", new_gem),
+            ]
+        });
+        let registry = RubygemsRegistry::with_base_urls(server.v1_base_url(), server.v2_base_url());
+        let fixture = TestDir::new("rubygems-changed-package");
+        let state_layout =
+            StateLayout::from_repo_root(fixture.path()).expect("state layout should build");
+        let workspace = ArtifactWorkspace::from_state_layout(&state_layout);
+
+        let result = process_version_change(
+            &registry,
+            &version_change("rails", "7.9.0", "8.0.0"),
+            &workspace,
+        )
+        .expect("rubygems changed package should process successfully");
+
+        assert_eq!(result.previous_package.version, "7.9.0");
+        assert_eq!(result.current_package.version, "8.0.0");
+        assert_eq!(result.diff.files_added, 2);
+        assert_eq!(result.diff.files_removed, 1);
+        assert_eq!(result.diff.files_changed, 2);
+        assert_eq!(result.diff.added_paths, vec!["exe", "exe/rails"]);
+        assert_eq!(result.diff.removed_paths, vec!["README.md"]);
+        assert_eq!(
+            result.diff.modified_paths,
+            vec!["lib/rails/version.rb", "lib/rails.rb"]
+        );
+        assert!(result.current_root.join("exe/rails").exists());
+        assert_eq!(
+            fs::read_to_string(result.current_root.join("lib/rails/version.rb"))
+                .expect("unpacked file should be readable"),
+            "VERSION = \"8.0.0\"\n"
+        );
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /api/v2/rubygems/rails/versions/7.9.0.json".to_string(),
+                "GET /gems/rails-7.9.0.gem".to_string(),
+                "GET /api/v2/rubygems/rails/versions/8.0.0.json".to_string(),
+                "GET /gems/rails-8.0.0.gem".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_download_destination_outside_version_scoped_cache() {
         let registry = RubygemsRegistry::new();
         let package = package_version("rails", "8.0.0");
@@ -610,35 +691,46 @@ mod tests {
         }
     }
 
+    fn version_change(
+        package: &str,
+        previous_version: &str,
+        current_version: &str,
+    ) -> VersionChange {
+        VersionChange {
+            package: package_version(package, current_version),
+            previous_version: previous_version.to_string(),
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct ResponseSpec {
         status_code: u16,
         method: String,
         path: String,
         content_type: &'static str,
-        body: String,
+        body: Vec<u8>,
         content_length: Option<u64>,
     }
 
     impl ResponseSpec {
-        fn json(status_code: u16, path: &str, body: impl Into<String>) -> Self {
+        fn json(status_code: u16, path: &str, body: impl AsRef<[u8]>) -> Self {
             Self {
                 status_code,
                 method: "GET".to_string(),
                 path: path.to_string(),
                 content_type: "application/json",
-                body: body.into(),
+                body: body.as_ref().to_vec(),
                 content_length: None,
             }
         }
 
-        fn get(status_code: u16, path: &str, body: impl Into<String>) -> Self {
+        fn get(status_code: u16, path: &str, body: impl AsRef<[u8]>) -> Self {
             Self {
                 status_code,
                 method: "GET".to_string(),
                 path: path.to_string(),
                 content_type: "application/octet-stream",
-                body: body.into(),
+                body: body.as_ref().to_vec(),
                 content_length: None,
             }
         }
@@ -649,7 +741,7 @@ mod tests {
                 method: "HEAD".to_string(),
                 path: path.to_string(),
                 content_type: "application/octet-stream",
-                body: String::new(),
+                body: Vec::new(),
                 content_length,
             }
         }
@@ -714,11 +806,12 @@ mod tests {
                             .push_str(&format!("Content-Length: {}\r\n", response_spec.body.len()));
                     }
                     response.push_str("\r\n");
+                    let mut response_bytes = response.into_bytes();
                     if response_spec.method != "HEAD" {
-                        response.push_str(&response_spec.body);
+                        response_bytes.extend_from_slice(&response_spec.body);
                     }
                     stream
-                        .write_all(response.as_bytes())
+                        .write_all(&response_bytes)
                         .expect("response should be written");
                 }
             });
@@ -841,5 +934,75 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    struct ArchiveFile<'a> {
+        path: &'a str,
+        contents: &'a [u8],
+    }
+
+    impl<'a> ArchiveFile<'a> {
+        fn new(path: &'a str, contents: &'a [u8]) -> Self {
+            Self { path, contents }
+        }
+    }
+
+    fn gem_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        let metadata_bytes = gzip_bytes(b"--- !ruby/object:Gem::Specification {}\n")?;
+        let data_bytes = tar_gz_bytes(files)?;
+
+        let cursor = Cursor::new(Vec::new());
+        let mut builder = Builder::new(cursor);
+        append_tar_file(&mut builder, "metadata.gz", &metadata_bytes)?;
+        append_tar_file(&mut builder, "data.tar.gz", &data_bytes)?;
+        builder.finish()?;
+
+        Ok(builder.into_inner()?.into_inner())
+    }
+
+    fn gzip_bytes(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes)?;
+        encoder.finish()
+    }
+
+    fn tar_gz_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        let cursor = Cursor::new(Vec::new());
+        let encoder = GzEncoder::new(cursor, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for file in files {
+            let mut header = Header::new_gnu();
+            header.set_path(file.path)?;
+            header.set_mode(0o644);
+            header.set_size(file.contents.len() as u64);
+            header.set_cksum();
+            builder.append(&header, file.contents)?;
+        }
+
+        let encoder = builder.into_inner()?;
+        let cursor = encoder.finish()?;
+        Ok(cursor.into_inner())
+    }
+
+    fn append_tar_file<W: Write>(
+        builder: &mut Builder<W>,
+        path: &str,
+        contents: &[u8],
+    ) -> std::io::Result<()> {
+        let mut header = Header::new_gnu();
+        header.set_path(path)?;
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        builder.append(&header, Cursor::new(contents))
+    }
+
+    fn rubygems_version_metadata_body(base_url: &str, version: &str, size: u64) -> String {
+        serde_json::json!({
+            "gem_uri": format!("{base_url}/gems/rails-{version}.gem"),
+            "size": size,
+        })
+        .to_string()
     }
 }
