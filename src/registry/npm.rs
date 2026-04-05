@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::fetch::{ArtifactCache, ArtifactMetadata, DownloadPolicy, FetchRequest, SafeDownloader};
 use crate::state::version_scoped_state_directory;
+use crate::unpack::SafeUnpacker;
 
 use super::{
     blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
@@ -272,8 +273,17 @@ impl Registry for NpmRegistry {
             })
     }
 
-    fn unpack(&self, _artifact: &Path, _destination: &Path) -> RegistryResult<()> {
-        Err(RegistryError::placeholder(self.ecosystem(), "unpack"))
+    fn unpack(&self, artifact: &Path, destination: &Path) -> RegistryResult<()> {
+        SafeUnpacker::new(Default::default())
+            .unpack_tar_gz(artifact, destination)
+            .map(|_| ())
+            .map_err(|source| {
+                RegistryError::new(format!(
+                    "failed to unpack npm artifact {} into {}: {source}",
+                    artifact.display(),
+                    destination.display()
+                ))
+            })
     }
 }
 
@@ -332,6 +342,8 @@ fn artifact_filename_from_url(url: &str) -> RegistryResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::collections::HashMap;
     use std::env;
     use std::fs;
@@ -341,6 +353,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tar::Builder;
 
     use crate::state::StateLayout;
 
@@ -508,6 +521,37 @@ mod tests {
                 "GET /chalk/-/chalk-5.4.0.tgz".to_string(),
                 "GET /chalk".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn unpacks_npm_tarball_with_safe_unpacker() {
+        let registry = NpmRegistry::new();
+        let fixture = TestDir::new("npm-unpack");
+        let artifact = fixture.path().join("chalk-5.4.0.tgz");
+        let destination = fixture.path().join("out");
+        write_tar_gz_archive(
+            &artifact,
+            &[
+                ArchiveFile::new("package/package.json", br#"{"name":"chalk"}"#),
+                ArchiveFile::new("package/source/index.js", b"export const chalk = true;\n"),
+            ],
+        )
+        .expect("artifact archive should be created");
+
+        registry
+            .unpack(&artifact, &destination)
+            .expect("npm tarball should unpack");
+
+        assert_eq!(
+            fs::read_to_string(destination.join("package/package.json"))
+                .expect("package json should exist"),
+            "{\"name\":\"chalk\"}"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("package/source/index.js"))
+                .expect("index should exist"),
+            "export const chalk = true;\n"
         );
     }
 
@@ -847,5 +891,35 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    struct ArchiveFile<'a> {
+        path: &'a str,
+        contents: &'a [u8],
+    }
+
+    impl<'a> ArchiveFile<'a> {
+        fn new(path: &'a str, contents: &'a [u8]) -> Self {
+            Self { path, contents }
+        }
+    }
+
+    fn write_tar_gz_archive(path: &Path, files: &[ArchiveFile<'_>]) -> std::io::Result<()> {
+        let file = fs::File::create(path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for file in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(file.path)?;
+            header.set_mode(0o644);
+            header.set_size(file.contents.len() as u64);
+            header.set_cksum();
+            builder.append(&header, file.contents)?;
+        }
+
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+        Ok(())
     }
 }
