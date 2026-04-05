@@ -24,6 +24,8 @@ use std::process::ExitCode;
 use artifact_pipeline::ProcessedChangeResult;
 use config::{ConfigError, WatchlistConfig};
 use registry::{RegistryAdapters, RegistryLookupResult};
+use report::{JsonReportInput, JsonReportWriter, MarkdownReportWriter, ReportError};
+use review::{Confidence, ReviewOutput, ReviewVerdict};
 use state::{BaselineState, SeenState, StateError, StateLayout};
 
 const USAGE: &str = concat!(
@@ -173,7 +175,16 @@ where
             state_layout
                 .save_seen_state(&next_seen_state)
                 .map_err(AppError::State)?;
-            print_change_summary(stdout, &state_layout, &detection, &artifact_processing)?;
+            let report_paths =
+                write_reports_for_processed_changes(&state_layout, &artifact_processing)
+                    .map_err(AppError::Report)?;
+            print_change_summary(
+                stdout,
+                &state_layout,
+                &detection,
+                &artifact_processing,
+                &report_paths,
+            )?;
             Ok(outcome)
         }
     }
@@ -211,6 +222,7 @@ fn print_change_summary<W>(
     state_layout: &StateLayout,
     detection: &state::ChangeDetection,
     artifact_processing: &[ProcessedChangeResult],
+    report_paths: &[GeneratedReportPaths],
 ) -> Result<(), AppError>
 where
     W: Write,
@@ -243,6 +255,7 @@ where
     }
 
     print_artifact_processing_summary(stdout, artifact_processing)?;
+    print_generated_reports_summary(stdout, report_paths)?;
 
     if !detection.unchanged.is_empty() {
         writeln!(stdout, "Unchanged:").map_err(AppError::Output)?;
@@ -344,6 +357,98 @@ where
                 .map_err(AppError::Output)?;
             }
         }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedReportPaths {
+    package_key: String,
+    json_path: PathBuf,
+    markdown_path: PathBuf,
+}
+
+fn write_reports_for_processed_changes(
+    state_layout: &StateLayout,
+    artifact_processing: &[ProcessedChangeResult],
+) -> Result<Vec<GeneratedReportPaths>, ReportError> {
+    let json_writer = JsonReportWriter::new(state_layout);
+    let markdown_writer = MarkdownReportWriter::new(state_layout);
+    let mut report_paths = Vec::new();
+
+    for processed in artifact_processing {
+        let Ok(result) = &processed.result else {
+            continue;
+        };
+
+        let review = placeholder_review_output(&result.analysis.signal_analysis);
+        let input = JsonReportInput {
+            status: "ok",
+            ecosystem: result.current_package.ecosystem,
+            package: &result.current_package.package,
+            old_version: &result.previous_package.version,
+            new_version: &result.current_package.version,
+            diff: &result.analysis.diff,
+            signals: &result.analysis.signal_analysis.signals,
+            manifest_diff: result
+                .analysis
+                .manifest_diff
+                .as_ref()
+                .map(|value| value.diff.clone()),
+            interesting_files: &result.analysis.signal_analysis.interesting_files,
+            review: &review,
+        };
+        let json_path = json_writer.write_analysis(input.clone())?;
+        let markdown_path = markdown_writer.write_analysis(input)?;
+        report_paths.push(GeneratedReportPaths {
+            package_key: result.current_package.package_key(),
+            json_path,
+            markdown_path,
+        });
+    }
+
+    Ok(report_paths)
+}
+
+fn placeholder_review_output(signal_analysis: &signals::SignalAnalysis) -> ReviewOutput {
+    ReviewOutput {
+        verdict: ReviewVerdict::NeedsReview,
+        confidence: Confidence::Low,
+        reasons: vec![
+            "review stage is not wired into `pincushion check` yet; manual review required"
+                .to_string(),
+        ],
+        focus_files: signal_analysis
+            .interesting_files
+            .iter()
+            .map(|excerpt| excerpt.path.clone())
+            .collect(),
+        failure_reason: None,
+    }
+}
+
+fn print_generated_reports_summary<W>(
+    stdout: &mut W,
+    report_paths: &[GeneratedReportPaths],
+) -> Result<(), AppError>
+where
+    W: Write,
+{
+    if report_paths.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(stdout, "Reports:").map_err(AppError::Output)?;
+    for report in report_paths {
+        writeln!(
+            stdout,
+            "  - {}: {} | {}",
+            report.package_key,
+            report.json_path.display(),
+            report.markdown_path.display()
+        )
+        .map_err(AppError::Output)?;
     }
 
     Ok(())
@@ -457,6 +562,7 @@ enum AppError {
     Config(ConfigError),
     StateLayout { path: PathBuf, source: io::Error },
     State(StateError),
+    Report(ReportError),
     Output(io::Error),
 }
 
@@ -471,6 +577,7 @@ impl fmt::Display for AppError {
                 path.display()
             ),
             Self::State(error) => write!(f, "{error}"),
+            Self::Report(error) => write!(f, "{error}"),
             Self::Output(error) => write!(f, "failed to write CLI output: {error}"),
         }
     }
@@ -483,6 +590,7 @@ impl Error for AppError {
             Self::Config(error) => Some(error),
             Self::StateLayout { source, .. } => Some(source),
             Self::State(error) => Some(error),
+            Self::Report(error) => Some(error),
             Self::Output(error) => Some(error),
         }
     }
@@ -532,6 +640,7 @@ mod tests {
         DownloadedArtifact, Ecosystem, PackageCoordinate, PackageVersion, RegistryError,
         RegistryLookupResult,
     };
+    use crate::signals::{Signal, SignalAnalysis};
     use crate::state::VersionChange;
 
     use super::{
@@ -696,6 +805,62 @@ mod tests {
     }
 
     #[test]
+    fn writes_reports_with_real_signal_analysis_for_successful_processed_changes() {
+        let fixture = TestFixture::new("signal-report");
+        fixture.write_config("npm:\n  - react\nreview:\n  provider: none\n");
+        fixture.write_seen("{\n  \"packages\": {\n    \"npm:react\": \"19.0.0\"\n  }\n}\n");
+
+        let mut stdout = Vec::new();
+        execute_check_with_processing(
+            fixture.config_path(),
+            &mut stdout,
+            |_config| vec![lookup_success(Ecosystem::Npm, "react", "19.1.0")],
+            |changes, _state_layout| {
+                vec![processed_success_with_signals(
+                    &changes[0],
+                    DiffSummary {
+                        files_added: 1,
+                        files_removed: 0,
+                        files_changed: 1,
+                        changed_paths: vec![
+                            "package.json".to_string(),
+                            "postinstall.js".to_string(),
+                        ],
+                        added_paths: vec!["postinstall.js".to_string()],
+                        removed_paths: Vec::new(),
+                        modified_paths: vec!["package.json".to_string()],
+                    },
+                    SignalAnalysis {
+                        signals: vec![Signal::InstallScriptAdded],
+                        interesting_files: Vec::new(),
+                    },
+                )]
+            },
+        )
+        .expect("signal report run should succeed");
+
+        let output = String::from_utf8(stdout).expect("stdout should be utf8");
+        assert!(output.contains("Reports:"));
+
+        let json_report = fixture
+            .root_path()
+            .join(".pincushion/reports/npm/react/19.0.0_to_19.1.0.json");
+        let markdown_report = fixture
+            .root_path()
+            .join(".pincushion/reports/npm/react/19.0.0_to_19.1.0.md");
+        let json_contents =
+            fs::read_to_string(&json_report).expect("json report should be written for signals");
+        let markdown_contents = fs::read_to_string(&markdown_report)
+            .expect("markdown report should be written for signals");
+
+        assert!(json_contents.contains("install-script-added"));
+        assert!(json_contents.contains("postinstall.js"));
+        assert!(markdown_contents.contains("install-script-added"));
+        assert!(markdown_contents.contains("postinstall.js"));
+        assert!(json_contents.contains("manual review required"));
+    }
+
+    #[test]
     fn reports_lookup_failures_as_partial_failure_and_persists_successful_versions() {
         let fixture = TestFixture::new("lookup-failure");
         fixture.write_config("npm:\n  - react\npypi:\n  - requests\nreview:\n  provider: none\n");
@@ -794,6 +959,14 @@ mod tests {
     }
 
     fn processed_success(change: &VersionChange, diff: DiffSummary) -> ProcessedChangeResult {
+        processed_success_with_signals(change, diff, SignalAnalysis::default())
+    }
+
+    fn processed_success_with_signals(
+        change: &VersionChange,
+        diff: DiffSummary,
+        signal_analysis: SignalAnalysis,
+    ) -> ProcessedChangeResult {
         ProcessedChangeResult {
             change: change.clone(),
             result: Ok(ProcessedVersionChange {
@@ -818,6 +991,7 @@ mod tests {
                 analysis: ProcessedVersionAnalysis {
                     diff,
                     manifest_diff: None,
+                    signal_analysis,
                 },
             }),
         }
@@ -848,6 +1022,10 @@ mod tests {
             fs::create_dir_all(&root).expect("fixture root should be created");
             let config_path = root.join("watchlist.yaml");
             Self { root, config_path }
+        }
+
+        fn root_path(&self) -> &Path {
+            &self.root
         }
 
         fn config_path(&self) -> &Path {

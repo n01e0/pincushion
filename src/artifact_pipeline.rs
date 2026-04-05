@@ -4,11 +4,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::diff::{DiffError, DiffSummary, ManifestDiff};
+use crate::diff::{DiffSummary, ManifestDiff};
 use crate::inventory::{InventoryError, InventorySummary};
 use crate::registry::{
     DownloadedArtifact, PackageVersion, Registry, RegistryError, RegistryPipeline,
 };
+use crate::signals::{SignalAnalysis, SignalError};
 use crate::state::{
     reset_state_directory, version_scoped_state_directory, StateLayout, VersionChange,
 };
@@ -56,6 +57,7 @@ impl ArtifactWorkspace {
 pub struct ProcessedVersionAnalysis {
     pub diff: DiffSummary,
     pub manifest_diff: Option<ManifestDiff>,
+    pub signal_analysis: SignalAnalysis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,7 +196,7 @@ pub enum ArtifactPipelineError {
     },
     Analysis {
         package: PackageVersion,
-        source: Box<DiffError>,
+        source: Box<ProcessedVersionAnalysisError>,
     },
 }
 
@@ -257,19 +259,54 @@ impl Error for ArtifactPipelineError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum ProcessedVersionAnalysisError {
+    ManifestDiff(crate::diff::DiffError),
+    Signals(SignalError),
+}
+
+impl fmt::Display for ProcessedVersionAnalysisError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ManifestDiff(source) => write!(f, "{source}"),
+            Self::Signals(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+impl Error for ProcessedVersionAnalysisError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ManifestDiff(source) => Some(source),
+            Self::Signals(source) => Some(source),
+        }
+    }
+}
+
 fn analyze_processed_version_change(
     ecosystem: crate::registry::Ecosystem,
     previous_root: &Path,
     current_root: &Path,
     previous_inventory: &InventorySummary,
     current_inventory: &InventorySummary,
-) -> Result<ProcessedVersionAnalysis, DiffError> {
+) -> Result<ProcessedVersionAnalysis, ProcessedVersionAnalysisError> {
     let diff = DiffSummary::between(previous_inventory, current_inventory);
-    let manifest_diff = ManifestDiff::extract(ecosystem, previous_root, current_root, &diff)?;
+    let manifest_diff = ManifestDiff::extract(ecosystem, previous_root, current_root, &diff)
+        .map_err(ProcessedVersionAnalysisError::ManifestDiff)?;
+    let signal_analysis = SignalAnalysis::analyze_v0(
+        ecosystem,
+        previous_root,
+        current_root,
+        previous_inventory,
+        current_inventory,
+        &diff,
+    )
+    .map_err(ProcessedVersionAnalysisError::Signals)?;
 
     Ok(ProcessedVersionAnalysis {
         diff,
         manifest_diff,
+        signal_analysis,
     })
 }
 
