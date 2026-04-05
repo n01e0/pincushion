@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use crate::fetch::{ArtifactCache, ArtifactMetadata, DownloadPolicy, FetchRequest, SafeDownloader};
 use crate::state::version_scoped_state_directory;
+use crate::unpack::SafeUnpacker;
 
 use super::{
     blocking_metadata_client, DownloadedArtifact, Ecosystem, PackageVersion, Registry,
@@ -213,8 +214,34 @@ impl Registry for PypiRegistry {
             })
     }
 
-    fn unpack(&self, _artifact: &Path, _destination: &Path) -> RegistryResult<()> {
-        Err(RegistryError::placeholder(self.ecosystem(), "unpack"))
+    fn unpack(&self, artifact: &Path, destination: &Path) -> RegistryResult<()> {
+        let unpacker = SafeUnpacker::default();
+        let file_name = artifact
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let result = if file_name.ends_with(".whl") {
+            unpacker.unpack_wheel(artifact, destination)
+        } else if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
+            unpacker.unpack_tar_gz(artifact, destination)
+        } else if file_name.ends_with(".zip") {
+            unpacker.unpack_zip(artifact, destination)
+        } else {
+            return Err(RegistryError::new(format!(
+                "unsupported pypi artifact format for {}",
+                artifact.display()
+            )));
+        };
+
+        result.map(|_| ()).map_err(|source| {
+            RegistryError::new(format!(
+                "failed to unpack pypi artifact {} into {}: {source}",
+                artifact.display(),
+                destination.display()
+            ))
+        })
     }
 }
 
@@ -291,12 +318,18 @@ impl PypiArtifact {
 mod tests {
     use std::env;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
+    use zip::write::FileOptions;
+    use zip::ZipWriter;
 
     use crate::state::StateLayout;
 
@@ -529,6 +562,74 @@ mod tests {
                 "GET /requests/json".to_string(),
                 "GET /files/requests-2.32.3-py3-none-any.whl".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn unpacks_sdist_tar_gz_artifacts_safely() {
+        let registry = PypiRegistry::new();
+        let fixture = TestDir::new("pypi-unpack-sdist");
+        let artifact = fixture.path().join("requests-2.32.3.tar.gz");
+        let destination = fixture.path().join("out");
+        write_tar_gz_archive(
+            &artifact,
+            &[
+                ArchiveFile::new("requests-2.32.3/README.md", b"hello\n"),
+                ArchiveFile::new(
+                    "requests-2.32.3/src/requests/__init__.py",
+                    b"__version__ = '2.32.3'\n",
+                ),
+            ],
+        )
+        .expect("sdist archive should be created");
+
+        registry
+            .unpack(&artifact, &destination)
+            .expect("sdist should unpack");
+
+        assert_eq!(
+            fs::read_to_string(destination.join("requests-2.32.3/README.md"))
+                .expect("readme should exist"),
+            "hello\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("requests-2.32.3/src/requests/__init__.py"))
+                .expect("package init should exist"),
+            "__version__ = '2.32.3'\n"
+        );
+    }
+
+    #[test]
+    fn unpacks_wheel_artifacts_safely() {
+        let registry = PypiRegistry::new();
+        let fixture = TestDir::new("pypi-unpack-wheel");
+        let artifact = fixture.path().join("requests-2.32.3-py3-none-any.whl");
+        let destination = fixture.path().join("out");
+        write_zip_archive(
+            &artifact,
+            &[
+                ArchiveFile::new("requests/__init__.py", b"__version__ = '2.32.3'\n"),
+                ArchiveFile::new(
+                    "requests-2.32.3.dist-info/METADATA",
+                    b"Name: requests\nVersion: 2.32.3\n",
+                ),
+            ],
+        )
+        .expect("wheel archive should be created");
+
+        registry
+            .unpack(&artifact, &destination)
+            .expect("wheel should unpack");
+
+        assert_eq!(
+            fs::read_to_string(destination.join("requests/__init__.py"))
+                .expect("package init should exist"),
+            "__version__ = '2.32.3'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("requests-2.32.3.dist-info/METADATA"))
+                .expect("metadata should exist"),
+            "Name: requests\nVersion: 2.32.3\n"
         );
     }
 
@@ -791,6 +892,49 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
+    }
+
+    struct ArchiveFile<'a> {
+        path: &'a str,
+        contents: &'a [u8],
+    }
+
+    impl<'a> ArchiveFile<'a> {
+        fn new(path: &'a str, contents: &'a [u8]) -> Self {
+            Self { path, contents }
+        }
+    }
+
+    fn write_tar_gz_archive(path: &Path, files: &[ArchiveFile<'_>]) -> std::io::Result<()> {
+        let file = fs::File::create(path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for file in files {
+            let mut header = Header::new_gnu();
+            header.set_path(file.path)?;
+            header.set_mode(0o644);
+            header.set_size(file.contents.len() as u64);
+            header.set_cksum();
+            builder.append(&header, Cursor::new(file.contents))?;
+        }
+
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+        Ok(())
+    }
+
+    fn write_zip_archive(path: &Path, files: &[ArchiveFile<'_>]) -> std::io::Result<()> {
+        let file = fs::File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+
+        for file in files {
+            writer.start_file(file.path, FileOptions::default())?;
+            writer.write_all(file.contents)?;
+        }
+
+        writer.finish()?;
+        Ok(())
     }
 
     struct TestDir {
