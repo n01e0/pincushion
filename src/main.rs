@@ -660,6 +660,9 @@ mod tests {
     use crate::diff::DiffSummary;
     use crate::inventory::InventorySummary;
     use crate::registry::crates::CratesRegistry;
+    use crate::registry::npm::NpmRegistry;
+    use crate::registry::pypi::PypiRegistry;
+    use crate::registry::rubygems::RubygemsRegistry;
     use crate::registry::{
         DownloadedArtifact, Ecosystem, PackageCoordinate, PackageVersion, Registry, RegistryError,
         RegistryLookupResult, RegistryPipeline,
@@ -870,6 +873,224 @@ mod tests {
                 "HEAD /api/v1/crates/reqwest/0.12.13/download".to_string(),
                 "GET /api/v1/crates/reqwest/0.12.13/download".to_string(),
                 "GET /files/reqwest-0.12.13.crate".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn checks_npm_rubygems_and_pypi_changed_packages_through_lookup_fetch_unpack_and_diff() {
+        let fixture = TestFixture::new("ecosystem-smoke-e2e");
+        fixture.write_config(
+            "npm:\n  - chalk\nrubygems:\n  - rails\npypi:\n  - requests\nreview:\n  provider: none\n",
+        );
+        fixture.write_seen(
+            "{\n  \"packages\": {\n    \"npm:chalk\": \"5.3.0\",\n    \"rubygems:rails\": \"7.2.0\",\n    \"pypi:requests\": \"2.31.0\"\n  }\n}\n",
+        );
+
+        let old_npm = tar_gz_archive_bytes(&[
+            ArchiveFile::new(
+                "package/package.json",
+                b"{\"name\":\"chalk\",\"version\":\"5.3.0\"}\n",
+            ),
+            ArchiveFile::new(
+                "package/source/index.js",
+                b"export const version = 'old';\n",
+            ),
+            ArchiveFile::new("package/README.md", b"old npm readme\n"),
+        ])
+        .expect("old npm tarball should be created");
+        let new_npm = tar_gz_archive_bytes(&[
+            ArchiveFile::new(
+                "package/package.json",
+                b"{\"name\":\"chalk\",\"version\":\"5.4.0\"}\n",
+            ),
+            ArchiveFile::new(
+                "package/source/index.js",
+                b"export const version = 'new';\n",
+            ),
+            ArchiveFile::new(
+                "package/source/browser.js",
+                b"export const browser = true;\n",
+            ),
+        ])
+        .expect("new npm tarball should be created");
+        let old_gem = gem_archive_bytes(&[
+            ArchiveFile::new("README.md", b"old gem readme\n"),
+            ArchiveFile::new("lib/rails.rb", b"module Rails\nend\n"),
+            ArchiveFile::new("lib/rails/version.rb", b"VERSION = \"7.2.0\"\n"),
+        ])
+        .expect("old gem should be created");
+        let new_gem = gem_archive_bytes(&[
+            ArchiveFile::new("lib/rails.rb", b"module Rails\n  VERSION = true\nend\n"),
+            ArchiveFile::new("lib/rails/version.rb", b"VERSION = \"8.0.0\"\n"),
+            ArchiveFile::new(
+                "lib/rails/engine.rb",
+                b"module Rails\n  class Engine; end\nend\n",
+            ),
+        ])
+        .expect("new gem should be created");
+        let old_pypi = tar_gz_archive_bytes(&[
+            ArchiveFile::new("src/requests/__init__.py", b"__version__ = '2.31.0'\n"),
+            ArchiveFile::new("README.md", b"old pypi readme\n"),
+        ])
+        .expect("old pypi sdist should be created");
+        let new_pypi = tar_gz_archive_bytes(&[
+            ArchiveFile::new("src/requests/__init__.py", b"__version__ = '2.32.3'\n"),
+            ArchiveFile::new("src/requests/api.py", b"def get():\n    return 'ok'\n"),
+        ])
+        .expect("new pypi sdist should be created");
+
+        let old_npm_size = old_npm.len() as u64;
+        let new_npm_size = new_npm.len() as u64;
+        let old_gem_size = old_gem.len() as u64;
+        let new_gem_size = new_gem.len() as u64;
+        let old_pypi_size = old_pypi.len() as u64;
+        let new_pypi_size = new_pypi.len() as u64;
+
+        let server = RequestSequenceServer::start_with_builder(move |base_url| {
+            vec![
+                ResponseSpec::json_get(
+                    200,
+                    "/chalk",
+                    &npm_versions_metadata_body("chalk", base_url, old_npm_size, new_npm_size),
+                ),
+                ResponseSpec::json_get(
+                    200,
+                    "/api/v1/gems/rails.json",
+                    &rubygems_package_metadata_body("8.0.0"),
+                ),
+                ResponseSpec::json_get(
+                    200,
+                    "/pypi/requests/json",
+                    &pypi_release_metadata_body(base_url, old_pypi_size, new_pypi_size),
+                ),
+                ResponseSpec::json_get(
+                    200,
+                    "/chalk",
+                    &npm_versions_metadata_body("chalk", base_url, old_npm_size, new_npm_size),
+                ),
+                ResponseSpec::get(200, "/chalk/-/chalk-5.3.0.tgz", old_npm),
+                ResponseSpec::json_get(
+                    200,
+                    "/chalk",
+                    &npm_versions_metadata_body("chalk", base_url, old_npm_size, new_npm_size),
+                ),
+                ResponseSpec::get(200, "/chalk/-/chalk-5.4.0.tgz", new_npm),
+                ResponseSpec::json_get(
+                    200,
+                    "/api/v2/rubygems/rails/versions/7.2.0.json",
+                    &rubygems_version_metadata_body(base_url, "7.2.0", old_gem_size),
+                ),
+                ResponseSpec::get(200, "/gems/rails-7.2.0.gem", old_gem),
+                ResponseSpec::json_get(
+                    200,
+                    "/api/v2/rubygems/rails/versions/8.0.0.json",
+                    &rubygems_version_metadata_body(base_url, "8.0.0", new_gem_size),
+                ),
+                ResponseSpec::get(200, "/gems/rails-8.0.0.gem", new_gem),
+                ResponseSpec::json_get(
+                    200,
+                    "/pypi/requests/json",
+                    &pypi_release_metadata_body(base_url, old_pypi_size, new_pypi_size),
+                ),
+                ResponseSpec::get(200, "/packages/requests-2.31.0.tar.gz", old_pypi),
+                ResponseSpec::json_get(
+                    200,
+                    "/pypi/requests/json",
+                    &pypi_release_metadata_body(base_url, old_pypi_size, new_pypi_size),
+                ),
+                ResponseSpec::get(200, "/packages/requests-2.32.3.tar.gz", new_pypi),
+            ]
+        });
+
+        let npm = NpmRegistry::with_metadata_base_url(server.base_url());
+        let rubygems = RubygemsRegistry::with_base_urls(
+            format!("{}/api/v1/gems", server.base_url()),
+            format!("{}/api/v2/rubygems", server.base_url()),
+        );
+        let pypi = PypiRegistry::with_metadata_base_url(format!("{}/pypi", server.base_url()));
+        let crates = NoopRegistry::new(Ecosystem::Crates);
+        let pipeline = RegistryPipeline::new(&npm, &rubygems, &pypi, &crates);
+
+        let mut stdout = Vec::new();
+        let outcome = execute_check_with_processing(
+            fixture.config_path(),
+            &mut stdout,
+            |config| pipeline.lookup_latest_versions(config),
+            |changes, state_layout| {
+                pipeline.process_version_changes_in_state_layout(changes, state_layout)
+            },
+        )
+        .expect("ecosystem smoke e2e run should succeed");
+
+        assert_eq!(outcome.exit_code(), std::process::ExitCode::SUCCESS);
+
+        let output = String::from_utf8(stdout).expect("stdout should be utf8");
+        assert!(output.contains("Detected 3 changed, 0 unchanged, and 0 newly tracked package(s)."));
+        assert!(output.contains("npm:chalk: 5.3.0 -> 5.4.0"));
+        assert!(output.contains("rubygems:rails: 7.2.0 -> 8.0.0"));
+        assert!(output.contains("pypi:requests: 2.31.0 -> 2.32.3"));
+        assert!(output.contains("npm:chalk: diff 1 added, 1 removed, 2 changed"));
+        assert!(output.contains("rubygems:rails: diff 1 added, 1 removed, 2 changed"));
+        assert!(output.contains("pypi:requests: diff 1 added, 1 removed, 1 changed"));
+        assert!(output.contains("added: package/source/browser.js"));
+        assert!(output.contains("added: lib/rails/engine.rb"));
+        assert!(output.contains("added: src/requests/api.py"));
+        assert!(output.contains("removed: package/README.md"));
+        assert!(output.contains("removed: README.md"));
+        assert!(output.contains("modified: package/package.json, package/source/index.js"));
+        assert!(output.contains("lib/rails.rb"));
+        assert!(output.contains("lib/rails/version.rb"));
+        assert!(output.contains("modified: src/requests/__init__.py"));
+
+        let npm_root = fixture
+            .root_path()
+            .join(".pincushion/unpacked/npm/chalk/5.4.0/package");
+        assert_eq!(
+            fs::read_to_string(npm_root.join("source/index.js"))
+                .expect("new npm source should exist"),
+            "export const version = 'new';\n"
+        );
+        assert!(npm_root.join("source/browser.js").exists());
+
+        let rubygems_root = fixture
+            .root_path()
+            .join(".pincushion/unpacked/rubygems/rails/8.0.0");
+        assert!(rubygems_root.join("lib/rails/engine.rb").exists());
+        assert_eq!(
+            fs::read_to_string(rubygems_root.join("lib/rails/version.rb"))
+                .expect("new gem version file should exist"),
+            "VERSION = \"8.0.0\"\n"
+        );
+
+        let pypi_root = fixture
+            .root_path()
+            .join(".pincushion/unpacked/pypi/requests/2.32.3");
+        assert!(pypi_root.join("src/requests/api.py").exists());
+        assert_eq!(
+            fs::read_to_string(pypi_root.join("src/requests/__init__.py"))
+                .expect("new pypi init should exist"),
+            "__version__ = '2.32.3'\n"
+        );
+
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /chalk".to_string(),
+                "GET /api/v1/gems/rails.json".to_string(),
+                "GET /pypi/requests/json".to_string(),
+                "GET /chalk".to_string(),
+                "GET /chalk/-/chalk-5.3.0.tgz".to_string(),
+                "GET /chalk".to_string(),
+                "GET /chalk/-/chalk-5.4.0.tgz".to_string(),
+                "GET /api/v2/rubygems/rails/versions/7.2.0.json".to_string(),
+                "GET /gems/rails-7.2.0.gem".to_string(),
+                "GET /api/v2/rubygems/rails/versions/8.0.0.json".to_string(),
+                "GET /gems/rails-8.0.0.gem".to_string(),
+                "GET /pypi/requests/json".to_string(),
+                "GET /packages/requests-2.31.0.tar.gz".to_string(),
+                "GET /pypi/requests/json".to_string(),
+                "GET /packages/requests-2.32.3.tar.gz".to_string(),
             ]
         );
     }
@@ -1331,10 +1552,24 @@ mod tests {
     }
 
     impl RequestSequenceServer {
+        fn start_with_builder(
+            build_responses: impl FnOnce(&str) -> Vec<ResponseSpec> + Send + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let address = listener.local_addr().expect("local addr should resolve");
+            let root_url = format!("http://{}", address);
+            let responses = build_responses(&root_url);
+            Self::spawn(listener, root_url, responses)
+        }
+
         fn start(responses: Vec<ResponseSpec>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
             let address = listener.local_addr().expect("local addr should resolve");
             let root_url = format!("http://{}", address);
+            Self::spawn(listener, root_url, responses)
+        }
+
+        fn spawn(listener: TcpListener, root_url: String, responses: Vec<ResponseSpec>) -> Self {
             let request_log = Arc::new(Mutex::new(Vec::new()));
             let request_log_for_thread = request_log.clone();
 
@@ -1389,6 +1624,10 @@ mod tests {
             }
         }
 
+        fn base_url(&self) -> &str {
+            &self.root_url
+        }
+
         fn metadata_base_url(&self) -> String {
             format!("{}/api/v1/crates", self.root_url)
         }
@@ -1420,6 +1659,10 @@ mod tests {
     }
 
     fn crate_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        tar_gz_archive_bytes(files)
+    }
+
+    fn tar_gz_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
         let cursor = Cursor::new(Vec::new());
         let encoder = GzEncoder::new(cursor, Compression::default());
         let mut builder = Builder::new(encoder);
@@ -1436,6 +1679,113 @@ mod tests {
         let encoder = builder.into_inner()?;
         let cursor = encoder.finish()?;
         Ok(cursor.into_inner())
+    }
+
+    fn gem_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        let metadata_bytes = gzip_bytes(b"--- !ruby/object:Gem::Specification {}\n")?;
+        let data_bytes = tar_gz_archive_bytes(files)?;
+
+        let cursor = Cursor::new(Vec::new());
+        let mut builder = Builder::new(cursor);
+        append_tar_file(&mut builder, "metadata.gz", &metadata_bytes)?;
+        append_tar_file(&mut builder, "data.tar.gz", &data_bytes)?;
+        builder.finish()?;
+
+        Ok(builder.into_inner()?.into_inner())
+    }
+
+    fn gzip_bytes(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes)?;
+        encoder.finish()
+    }
+
+    fn append_tar_file<W: Write>(
+        builder: &mut Builder<W>,
+        path: &str,
+        contents: &[u8],
+    ) -> std::io::Result<()> {
+        let mut header = Header::new_gnu();
+        header.set_path(path)?;
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        builder.append(&header, Cursor::new(contents))
+    }
+
+    fn npm_versions_metadata_body(
+        package: &str,
+        base_url: &str,
+        old_size: u64,
+        new_size: u64,
+    ) -> String {
+        serde_json::json!({
+            "dist-tags": {
+                "latest": "5.4.0"
+            },
+            "versions": {
+                "5.3.0": {
+                    "dist": {
+                        "tarball": format!("{base_url}/{package}/-/chalk-5.3.0.tgz"),
+                        "size": old_size,
+                    }
+                },
+                "5.4.0": {
+                    "dist": {
+                        "tarball": format!("{base_url}/{package}/-/chalk-5.4.0.tgz"),
+                        "size": new_size,
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn rubygems_package_metadata_body(version: &str) -> String {
+        serde_json::json!({ "version": version }).to_string()
+    }
+
+    fn rubygems_version_metadata_body(base_url: &str, version: &str, size: u64) -> String {
+        serde_json::json!({
+            "gem_uri": format!("{base_url}/gems/rails-{version}.gem"),
+            "size": size,
+        })
+        .to_string()
+    }
+
+    fn pypi_release_metadata_body(base_url: &str, old_size: u64, new_size: u64) -> String {
+        serde_json::json!({
+            "info": {
+                "version": "2.32.3"
+            },
+            "urls": [
+                {
+                    "filename": "requests-2.32.3.tar.gz",
+                    "packagetype": "sdist",
+                    "url": format!("{base_url}/packages/requests-2.32.3.tar.gz"),
+                    "size": new_size,
+                }
+            ],
+            "releases": {
+                "2.31.0": [
+                    {
+                        "filename": "requests-2.31.0.tar.gz",
+                        "packagetype": "sdist",
+                        "url": format!("{base_url}/packages/requests-2.31.0.tar.gz"),
+                        "size": old_size,
+                    }
+                ],
+                "2.32.3": [
+                    {
+                        "filename": "requests-2.32.3.tar.gz",
+                        "packagetype": "sdist",
+                        "url": format!("{base_url}/packages/requests-2.32.3.tar.gz"),
+                        "size": new_size,
+                    }
+                ]
+            }
+        })
+        .to_string()
     }
 
     #[derive(Debug, Clone, Copy)]
