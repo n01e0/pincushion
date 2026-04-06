@@ -38,7 +38,8 @@ impl CratesRegistry {
         }
     }
 
-    fn with_base_urls(
+    #[cfg(test)]
+    pub(crate) fn with_base_urls(
         metadata_base_url: impl Into<String>,
         download_base_url: impl Into<String>,
     ) -> Self {

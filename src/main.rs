@@ -641,10 +641,17 @@ impl Error for CliError {}
 mod tests {
     use std::env;
     use std::fs;
+    use std::io::{Cursor, Read, Write};
+    use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
 
     use crate::artifact_pipeline::{
         ArtifactPipelineError, ProcessedChangeResult, ProcessedVersionAnalysis,
@@ -652,9 +659,10 @@ mod tests {
     };
     use crate::diff::DiffSummary;
     use crate::inventory::InventorySummary;
+    use crate::registry::crates::CratesRegistry;
     use crate::registry::{
-        DownloadedArtifact, Ecosystem, PackageCoordinate, PackageVersion, RegistryError,
-        RegistryLookupResult,
+        DownloadedArtifact, Ecosystem, PackageCoordinate, PackageVersion, Registry, RegistryError,
+        RegistryLookupResult, RegistryPipeline,
     };
     use crate::signals::{Signal, SignalAnalysis};
     use crate::state::VersionChange;
@@ -744,6 +752,126 @@ mod tests {
         assert!(seen_contents.contains("\"npm:react\": \"19.1.0\""));
         assert!(seen_contents.contains("\"crates:clap\": \"4.5.31\""));
         assert!(seen_contents.contains("\"pypi:requests\": \"2.32.3\""));
+    }
+
+    #[test]
+    fn checks_workspace_crates_dependency_through_lookup_fetch_unpack_and_diff() {
+        const WORKSPACE_CRATE_DEPENDENCY: &str = "reqwest";
+        assert!(
+            include_str!("../Cargo.toml").contains("\nreqwest ="),
+            "expected {WORKSPACE_CRATE_DEPENDENCY} to remain a workspace crates dependency"
+        );
+
+        let fixture = TestFixture::new("workspace-crates-e2e");
+        fixture.write_config("crates:\n  - reqwest\nreview:\n  provider: none\n");
+        fixture.write_seen("{\n  \"packages\": {\n    \"crates:reqwest\": \"0.11.26\"\n  }\n}\n");
+
+        let old_crate = crate_archive_bytes(&[
+            ArchiveFile::new(
+                "reqwest/Cargo.toml",
+                b"[package]\nname = \"reqwest\"\nversion = \"0.11.26\"\n",
+            ),
+            ArchiveFile::new(
+                "reqwest/src/client.rs",
+                b"pub fn client() {\n    println!(\"old\");\n}\n",
+            ),
+            ArchiveFile::new("reqwest/README.md", b"old readme\n"),
+        ])
+        .expect("old reqwest crate should be created");
+        let new_crate = crate_archive_bytes(&[
+            ArchiveFile::new(
+                "reqwest/Cargo.toml",
+                b"[package]\nname = \"reqwest\"\nversion = \"0.12.13\"\n",
+            ),
+            ArchiveFile::new(
+                "reqwest/src/client.rs",
+                b"pub fn client() {\n    println!(\"new\");\n}\n",
+            ),
+            ArchiveFile::new("reqwest/src/blocking.rs", b"pub fn blocking() {}\n"),
+        ])
+        .expect("new reqwest crate should be created");
+        let old_size = old_crate.len() as u64;
+        let new_size = new_crate.len() as u64;
+
+        let server = RequestSequenceServer::start(vec![
+            ResponseSpec::json_get(
+                200,
+                "/api/v1/crates/reqwest",
+                r#"{"crate":{"max_stable_version":"0.12.13","newest_version":"0.12.13"}}"#,
+            ),
+            ResponseSpec::head(
+                200,
+                "/api/v1/crates/reqwest/0.11.26/download",
+                Some(old_size),
+            ),
+            ResponseSpec::redirect(
+                "/api/v1/crates/reqwest/0.11.26/download",
+                "/files/reqwest-0.11.26.crate",
+            ),
+            ResponseSpec::get(200, "/files/reqwest-0.11.26.crate", old_crate),
+            ResponseSpec::head(
+                200,
+                "/api/v1/crates/reqwest/0.12.13/download",
+                Some(new_size),
+            ),
+            ResponseSpec::redirect(
+                "/api/v1/crates/reqwest/0.12.13/download",
+                "/files/reqwest-0.12.13.crate",
+            ),
+            ResponseSpec::get(200, "/files/reqwest-0.12.13.crate", new_crate),
+        ]);
+        let crates =
+            CratesRegistry::with_base_urls(server.metadata_base_url(), server.download_base_url());
+        let npm = NoopRegistry::new(Ecosystem::Npm);
+        let rubygems = NoopRegistry::new(Ecosystem::Rubygems);
+        let pypi = NoopRegistry::new(Ecosystem::Pypi);
+        let pipeline = RegistryPipeline::new(&npm, &rubygems, &pypi, &crates);
+
+        let mut stdout = Vec::new();
+        let outcome = execute_check_with_processing(
+            fixture.config_path(),
+            &mut stdout,
+            |config| pipeline.lookup_latest_versions(config),
+            |changes, state_layout| {
+                pipeline.process_version_changes_in_state_layout(changes, state_layout)
+            },
+        )
+        .expect("workspace crates e2e run should succeed");
+
+        assert_eq!(outcome.exit_code(), std::process::ExitCode::SUCCESS);
+
+        let output = String::from_utf8(stdout).expect("stdout should be utf8");
+        assert!(output.contains("Detected 1 changed, 0 unchanged, and 0 newly tracked package(s)."));
+        assert!(output.contains("Changed:"));
+        assert!(output.contains("crates:reqwest: 0.11.26 -> 0.12.13"));
+        assert!(output.contains("Artifact processing:"));
+        assert!(output.contains("crates:reqwest: diff 1 added, 1 removed, 2 changed"));
+        assert!(output.contains("added: reqwest/src/blocking.rs"));
+        assert!(output.contains("removed: reqwest/README.md"));
+        assert!(output.contains("modified: reqwest/Cargo.toml, reqwest/src/client.rs"));
+
+        let unpacked_root = fixture
+            .root_path()
+            .join(".pincushion/unpacked/crates/reqwest/0.12.13/reqwest");
+        assert_eq!(
+            fs::read_to_string(unpacked_root.join("src/client.rs"))
+                .expect("new reqwest client source should exist"),
+            "pub fn client() {\n    println!(\"new\");\n}\n"
+        );
+        assert!(unpacked_root.join("src/blocking.rs").exists());
+
+        assert_eq!(
+            server.request_log(),
+            vec![
+                "GET /api/v1/crates/reqwest".to_string(),
+                "HEAD /api/v1/crates/reqwest/0.11.26/download".to_string(),
+                "GET /api/v1/crates/reqwest/0.11.26/download".to_string(),
+                "GET /files/reqwest-0.11.26.crate".to_string(),
+                "HEAD /api/v1/crates/reqwest/0.12.13/download".to_string(),
+                "GET /api/v1/crates/reqwest/0.12.13/download".to_string(),
+                "GET /files/reqwest-0.12.13.crate".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1132,6 +1260,224 @@ mod tests {
         ProcessedChangeResult {
             change: change.clone(),
             result: Err(error),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ResponseSpec {
+        status_code: u16,
+        method: String,
+        path: String,
+        content_type: &'static str,
+        body: Vec<u8>,
+        content_length: Option<u64>,
+        extra_headers: Vec<(String, String)>,
+    }
+
+    impl ResponseSpec {
+        fn get(status_code: u16, path: &str, body: impl AsRef<[u8]>) -> Self {
+            Self {
+                status_code,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "application/octet-stream",
+                body: body.as_ref().to_vec(),
+                content_length: None,
+                extra_headers: Vec::new(),
+            }
+        }
+
+        fn json_get(status_code: u16, path: &str, body: &str) -> Self {
+            Self {
+                status_code,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "application/json",
+                body: body.as_bytes().to_vec(),
+                content_length: None,
+                extra_headers: Vec::new(),
+            }
+        }
+
+        fn redirect(path: &str, location: &str) -> Self {
+            Self {
+                status_code: 302,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                content_type: "text/plain",
+                body: Vec::new(),
+                content_length: Some(0),
+                extra_headers: vec![("Location".to_string(), location.to_string())],
+            }
+        }
+
+        fn head(status_code: u16, path: &str, content_length: Option<u64>) -> Self {
+            Self {
+                status_code,
+                method: "HEAD".to_string(),
+                path: path.to_string(),
+                content_type: "application/octet-stream",
+                body: Vec::new(),
+                content_length,
+                extra_headers: Vec::new(),
+            }
+        }
+    }
+
+    struct RequestSequenceServer {
+        root_url: String,
+        request_log: Arc<Mutex<Vec<String>>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl RequestSequenceServer {
+        fn start(responses: Vec<ResponseSpec>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+            let address = listener.local_addr().expect("local addr should resolve");
+            let root_url = format!("http://{}", address);
+            let request_log = Arc::new(Mutex::new(Vec::new()));
+            let request_log_for_thread = request_log.clone();
+
+            let thread = thread::spawn(move || {
+                for response_spec in responses {
+                    let (mut stream, _) = listener.accept().expect("request should arrive");
+                    let mut buffer = [0_u8; 4096];
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("request should be readable");
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let mut request_line_parts =
+                        request.lines().next().unwrap_or("").split_whitespace();
+                    let method = request_line_parts.next().unwrap_or("");
+                    let path = request_line_parts.next().unwrap_or("");
+                    request_log_for_thread
+                        .lock()
+                        .expect("request log lock should succeed")
+                        .push(format!("{method} {path}"));
+                    assert_eq!(method, response_spec.method, "unexpected request method");
+                    assert_eq!(path, response_spec.path, "unexpected request path");
+
+                    let mut response = format!(
+                        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nConnection: close\r\n",
+                        response_spec.status_code, response_spec.content_type
+                    );
+                    if let Some(content_length) = response_spec.content_length {
+                        response.push_str(&format!("Content-Length: {content_length}\r\n"));
+                    }
+                    if response_spec.method != "HEAD" && response_spec.content_length.is_none() {
+                        response
+                            .push_str(&format!("Content-Length: {}\r\n", response_spec.body.len()));
+                    }
+                    for (name, value) in &response_spec.extra_headers {
+                        response.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    response.push_str("\r\n");
+                    let mut response_bytes = response.into_bytes();
+                    if response_spec.method != "HEAD" {
+                        response_bytes.extend_from_slice(&response_spec.body);
+                    }
+                    stream
+                        .write_all(&response_bytes)
+                        .expect("response should be written");
+                }
+            });
+
+            Self {
+                root_url,
+                request_log,
+                thread: Some(thread),
+            }
+        }
+
+        fn metadata_base_url(&self) -> String {
+            format!("{}/api/v1/crates", self.root_url)
+        }
+
+        fn download_base_url(&self) -> String {
+            format!("{}/api/v1/crates", self.root_url)
+        }
+
+        fn request_log(mut self) -> Vec<String> {
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("server thread should finish");
+            }
+            self.request_log
+                .lock()
+                .expect("request log lock should succeed")
+                .clone()
+        }
+    }
+
+    struct ArchiveFile<'a> {
+        path: &'a str,
+        contents: &'a [u8],
+    }
+
+    impl<'a> ArchiveFile<'a> {
+        fn new(path: &'a str, contents: &'a [u8]) -> Self {
+            Self { path, contents }
+        }
+    }
+
+    fn crate_archive_bytes(files: &[ArchiveFile<'_>]) -> std::io::Result<Vec<u8>> {
+        let cursor = Cursor::new(Vec::new());
+        let encoder = GzEncoder::new(cursor, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for file in files {
+            let mut header = Header::new_gnu();
+            header.set_path(file.path)?;
+            header.set_mode(0o644);
+            header.set_size(file.contents.len() as u64);
+            header.set_cksum();
+            builder.append(&header, Cursor::new(file.contents))?;
+        }
+
+        let encoder = builder.into_inner()?;
+        let cursor = encoder.finish()?;
+        Ok(cursor.into_inner())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct NoopRegistry {
+        ecosystem: Ecosystem,
+    }
+
+    impl NoopRegistry {
+        fn new(ecosystem: Ecosystem) -> Self {
+            Self { ecosystem }
+        }
+    }
+
+    impl Registry for NoopRegistry {
+        fn ecosystem(&self) -> Ecosystem {
+            self.ecosystem
+        }
+
+        fn latest_version(&self, package: &str) -> Result<PackageVersion, RegistryError> {
+            Err(RegistryError::new(format!(
+                "unexpected latest_version lookup for {}:{}",
+                self.ecosystem.as_str(),
+                package
+            )))
+        }
+
+        fn download_artifact(
+            &self,
+            package: &PackageVersion,
+            _destination: &Path,
+        ) -> Result<DownloadedArtifact, RegistryError> {
+            Err(RegistryError::new(format!(
+                "unexpected download for {}",
+                package.package_key()
+            )))
+        }
+
+        fn unpack(&self, artifact: &Path, _destination: &Path) -> Result<(), RegistryError> {
+            Err(RegistryError::new(format!(
+                "unexpected unpack for {}",
+                artifact.display()
+            )))
         }
     }
 
