@@ -31,14 +31,16 @@ impl RubygemsRegistry {
         }
     }
 
-    fn with_metadata_base_url(metadata_base_url: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_metadata_base_url(metadata_base_url: impl Into<String>) -> Self {
         Self {
             metadata_base_url: metadata_base_url.into().trim_end_matches('/').to_string(),
             version_metadata_base_url: DEFAULT_VERSION_METADATA_BASE_URL.to_string(),
         }
     }
 
-    fn with_base_urls(
+    #[cfg(test)]
+    pub(crate) fn with_base_urls(
         metadata_base_url: impl Into<String>,
         version_metadata_base_url: impl Into<String>,
     ) -> Self {

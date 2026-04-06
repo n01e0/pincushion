@@ -29,7 +29,8 @@ impl NpmRegistry {
         }
     }
 
-    fn with_metadata_base_url(metadata_base_url: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_metadata_base_url(metadata_base_url: impl Into<String>) -> Self {
         Self {
             metadata_base_url: metadata_base_url.into().trim_end_matches('/').to_string(),
         }
